@@ -1,7 +1,7 @@
 [project]
 name = "eramegaten-engine"
 version = "0.1.0"
-description = "A modern Python 3.11 EraBasic/Emuera-compatible runtime focused on E:\\mgt eraMegaten."
+description = "A modern Python 3.11 EraBasic/Emuera-compatible runtime for eraMegaten."
 requires-python = ">=3.11"
 authors = [{name = "Codex"}]
 
