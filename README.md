@@ -1,41 +1,23 @@
 # eraMegaten Engine
 
-A Python compatibility engine for running and testing EraBasic / Emuera-style eraMegaten scripts.
+一个用于解析、运行和测试 EraBasic / Emuera 风格脚本的 Python 兼容引擎。
 
-This repository contains the engine code only. It does not include game assets, game scripts, saves, or other game data.
+本仓库只包含引擎实现和测试，不包含游戏脚本、素材、存档或其他游戏数据。
 
-## Features
+## 功能概览
 
-- Load ERB / ERH scripts and CSV data from a user-provided game directory.
-- Interpret common EraBasic control flow, expressions, variables, arrays, input, output, and save helpers.
-- Provide a CLI for auditing, inspecting, and replaying script entry points.
-- Include regression tests for parser, runtime, save, graphics, and compatibility behavior.
+- 加载 ERB / ERH 脚本和 CSV 数据。
+- 执行常见控制流、表达式、变量、数组、输入输出和存档辅助逻辑。
+- 提供命令行工具用于审计、查看和重放脚本入口。
+- 包含运行时、图形和兼容性回归测试。
 
-## Quick start
+## 基本使用
 
 ```powershell
 python -m pip install -e .
 python -m pytest tests\test_engine.py -q
 ```
 
-Run the CLI with your own game directory:
+## 项目状态
 
-```powershell
-python -m eramegaten_engine.cli audit <game-root>
-python -m eramegaten_engine.cli inspect <game-root> SYSTEM_TITLE
-python -m eramegaten_engine.cli run <game-root> --entry SYSTEM_TITLE --non-interactive
-```
-
-## Requirements
-
-- Python 3.11 or newer
-- pytest for tests
-- Pillow for optional image rendering/export helpers
-
-## Status
-
-The engine is experimental and still improving. It is useful for script analysis, automated replay, compatibility testing, and future UI work.
-
-## License
-
-No license has been selected yet.
+项目仍在实验阶段，适合脚本分析、自动化回放和兼容性验证。
