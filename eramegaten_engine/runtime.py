@@ -146,6 +146,7 @@ class EraRuntime:
         self.mouse_button = ""
         self.await_count = 0
         self.last_await_millis = 0
+        self.timed_wait_events: list[dict[str, Any]] = []
         self.flow_input_default: str | None = None
         self.flow_input_allow_click = 0
         self.flow_input_allow_skip = 0
@@ -1619,8 +1620,37 @@ class EraRuntime:
         millis = max(0, to_int(eval_expr(self, rest, default=0))) if rest else 0
         self.await_count += 1
         self.last_await_millis = millis
+        self._record_timed_wait("AWAIT", millis, allow_skip=False)
         if self.interactive and millis > 0:
             time.sleep(millis / 1000.0)
+
+    def _record_timed_wait(self, command: str, millis: int, *, allow_skip: bool) -> None:
+        self.timed_wait_events.append({
+            "command": command,
+            "millis": max(0, int(millis)),
+            "allow_skip": bool(allow_skip),
+        })
+
+    def _exec_twait(self, rest: str) -> None:
+        parts = split_era_args(rest)
+        millis = max(0, to_int(eval_expr(self, parts[0], default=0))) if parts else 0
+        allow_skip = truth(eval_expr(self, parts[1], default=0)) if len(parts) >= 2 and parts[1].strip() else False
+        self._record_timed_wait("TWAIT", millis, allow_skip=allow_skip)
+        if self.interactive and millis > 0:
+            time.sleep(millis / 1000.0)
+
+    def _exec_forcewait(self) -> None:
+        self._record_timed_wait("FORCEWAIT", 0, allow_skip=False)
+        if self.interactive or self.inputs:
+            self._input("")
+
+    def _record_timed_input_wait(self, key: str, rest: str) -> None:
+        if key not in {"TINPUT", "TINPUTS", "TONEINPUT", "TONEINPUTS"}:
+            return
+        parts = split_era_args(rest)
+        millis = max(0, to_int(eval_expr(self, parts[0], default=0))) if parts else 0
+        allow_skip = truth(eval_expr(self, parts[2], default=0)) if len(parts) >= 3 and parts[2].strip() else False
+        self._record_timed_wait(key, millis, allow_skip=allow_skip)
 
     def _eval_sound_media_arg(self, rest: str) -> str:
         parts = split_era_args(rest)
@@ -1960,11 +1990,15 @@ class EraRuntime:
             frame.pc += 1
             return
         if key in {"FORCEWAIT", "TWAIT"}:
-            if key == "FORCEWAIT" and (self.interactive or self.inputs):
-                self._input("")
+            if key == "TWAIT":
+                self._exec_twait(rest)
+            elif key == "FORCEWAIT" and (self.interactive or self.inputs):
+                self._exec_forcewait()
             elif key == "FORCEWAIT" and not self.interactive and self.had_explicit_inputs:
                 self.waiting_for_input = True
                 return
+            elif key == "FORCEWAIT":
+                self._exec_forcewait()
             frame.pc += 1
             return
         if key in {"INPUT", "ONEINPUT", "INPUTS", "ONEINPUTS", "TINPUT", "TINPUTS", "TONEINPUT", "TONEINPUTS"}:
@@ -2631,7 +2665,9 @@ class EraRuntime:
                     return True
             return True
         if key == "TINPUTINT":
+            millis = max(0, to_int(args[0])) if args else 0
             default = to_int(args[1]) if len(args) >= 2 else 0
+            show_timer = truth(args[2]) if len(args) >= 3 else False
             allowed = [to_int(a) for a in args[3:]]
             while True:
                 if (
@@ -2643,6 +2679,7 @@ class EraRuntime:
                 ):
                     self.waiting_for_input = True
                     return True
+                self._record_timed_wait("TINPUTINT", millis, allow_skip=show_timer)
                 raw = self._input(str(default))
                 value = to_int(raw)
                 if value == default or value in allowed:
@@ -5722,6 +5759,7 @@ class EraRuntime:
 
     def _exec_input(self, key: str, rest: str) -> None:
         _, default = self._input_default(key, rest)
+        self._record_timed_input_wait(key, rest)
         value = self._input(default)
         if key in {"ONEINPUT", "ONEINPUTS", "TONEINPUT", "TONEINPUTS"} and value:
             value = value[:1]
@@ -6817,7 +6855,31 @@ class EraRuntime:
         self.memory.set_var(ref.base, ref.indices, old + (1 if m.group(2) == "++" else -1))
         return True
 
+    def _exec_replace_command(self, rest: str) -> bool:
+        parts = split_era_args(rest)
+        if len(parts) < 3:
+            return False
+        target_text = parts[0].strip()
+        try:
+            ref = parse_lvalue(self, target_text)
+        except Exception:
+            ref = None
+        if ref is not None:
+            source = to_str(self.memory.get_var(ref.base, ref.indices))
+        else:
+            source = to_str(eval_expr(self, parts[0], default=self.render_form(parts[0]).strip().strip('"')))
+        pattern = to_str(eval_expr(self, parts[1], default=self.render_form(parts[1]).strip().strip('"')))
+        replacement = to_str(eval_expr(self, parts[2], default=self.render_form(parts[2]).strip().strip('"')))
+        value = to_str(call_builtin(self, "REPLACE", [source, pattern, replacement]) or "")
+        if ref is not None:
+            self.memory.set_var(ref.base, ref.indices, value)
+        self.memory.set_var("RESULTS", [], value)
+        self.memory.set_var("RESULT", [], to_int(value))
+        return True
+
     def _exec_builtin_command(self, key: str, rest: str) -> bool:
+        if key == "REPLACE":
+            return self._exec_replace_command(rest)
         if not rest and call_builtin(self, key, []) is None:
             return False
         raw_first = key in {"GETNUM", "SUMARRAY", "SUMCARRAY", "MAXARRAY", "MINARRAY", "MAXCARRAY", "MINCARRAY", "INRANGEARRAY", "INRANGECARRAY", "MATCH", "FINDELEMENT", "FINDLASTELEMENT", "VARSIZE", "ERDNAME", "FINDCHARA", "FINDLASTCHARA", "CMATCH", "ISDEFINED", "EXISTVAR", "EXISTFUNCTION", "GETVAR", "GETVARS", "SETVAR", "VARSETEX", "STRJOIN"} or key.startswith(("ENUMFUNC", "ENUMVAR", "ENUMMACRO"))

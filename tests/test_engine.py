@@ -3713,6 +3713,9 @@ RETURN
         )
         self.assertEqual(rt.await_count, 1)
         self.assertEqual(rt.last_await_millis, 12)
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "AWAIT", "millis": 12, "allow_skip": False},
+        ])
         self.assertEqual(rt.warnings, [])
 
         rt_inactive = EraRuntime(program, echo=False, interactive=False)
@@ -3724,6 +3727,69 @@ RETURN
         rt_inactive.run("SYSTEM_TITLE", max_steps=100)
         self.assertIn("tick=0:9:-8::0:0\ntrig=0:0\nkeycmd=0:0\n", "".join(rt_inactive.output))
         self.assertEqual(rt_inactive.warnings, [])
+
+    def test_twait_records_timed_wait_metadata_without_blocking_replay(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+#DIM nTextLen
+#DIM nFinishWait
+#DIM LOCAL
+nTextLen = 3
+nFinishWait = 250
+TWAIT 12 + 3, 1
+TWAIT (LOCAL + 1 < nTextLen ? 100 # nFinishWait), 0
+PRINTL done
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "done\n")
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "TWAIT", "millis": 15, "allow_skip": True},
+            {"command": "TWAIT", "millis": 100, "allow_skip": False},
+        ])
+        self.assertEqual(rt.await_count, 0)
+        self.assertEqual(rt.warnings, [])
+
+    def test_timed_input_commands_record_wait_metadata(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+TINPUTS 100, "fallback", 0
+PRINTFORML S=%RESULTS%
+TINPUT 250, 7, 1
+PRINTFORML N={RESULT}:%RESULTS%
+TONEINPUTS 10, "xy", 0
+PRINTFORML OS=%RESULTS%
+TONEINPUT 20, 12, 1
+PRINTFORML ON={RESULT}:%RESULTS%
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "S=fallback\nN=7:7\nOS=x\nON=1:1\n")
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "TINPUTS", "millis": 100, "allow_skip": False},
+            {"command": "TINPUT", "millis": 250, "allow_skip": True},
+            {"command": "TONEINPUTS", "millis": 10, "allow_skip": False},
+            {"command": "TONEINPUT", "millis": 20, "allow_skip": True},
+        ])
+        self.assertEqual(rt.warnings, [])
+
+    def test_native_tinputint_records_each_timed_attempt(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+CALL TINPUTINT(5000, -1, 1, 0, 1, 2, 3, 9)
+PRINTFORML A={RESULT}:%RESULTS%
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False, inputs=["7"])
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "A=-1:-1\n")
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "TINPUTINT", "millis": 5000, "allow_skip": True},
+            {"command": "TINPUTINT", "millis": 5000, "allow_skip": True},
+        ])
+        self.assertEqual(rt.warnings, [])
 
     def test_inputany_binput_and_flowinput_defaults(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -5228,6 +5294,30 @@ RETURN
         )
         self.assertEqual(rt.warnings, [])
 
+    def test_replace_command_writes_back_first_string_argument(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+#DIMS PARTS, 4
+PARTS:0 = ア_イ_ウ
+REPLACE PARTS:0, "_", ""
+PRINTFORML A=%PARTS:0%/%RESULTS%
+RESULTS:1 = ab12
+REPLACE RESULTS:1, "([a-z]+)(\\d+)", "$2-$1"
+PRINTFORML B=%RESULTS:1%/%RESULTS%
+REPLACE "x_y", "_", ""
+PRINTFORML C=%RESULTS%
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual(
+            "".join(rt.output),
+            "A=アイウ/アイウ\n"
+            "B=12-ab/12-ab\n"
+            "C=xy\n",
+        )
+        self.assertEqual(rt.warnings, [])
+
     def test_chkdata_results_for_sidecar_and_native_headers(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 SAVEDATA 4, "sidecar caption"
@@ -6683,6 +6773,9 @@ RETURN
         rt.continue_run(max_steps=50)
         self.assertEqual("".join(rt.output), "before\nmid\nafter\n")
         self.assertFalse(rt.waiting_for_input)
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "FORCEWAIT", "millis": 0, "allow_skip": False},
+        ])
         self.assertEqual(rt.warnings, [])
 
     def test_noninteractive_printw_preserves_stack_without_duplicate_output(self):
