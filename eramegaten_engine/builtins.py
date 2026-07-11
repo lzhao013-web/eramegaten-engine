@@ -484,9 +484,7 @@ def _raw_identifier_text(text: Value) -> str:
 def b_getnum(ctx, args):
     var = _raw_identifier_text(arg(args, 0))
     name = to_str(arg(args, 1))
-    if ctx.program.csv:
-        return ctx.program.csv.resolve_index(var, name)
-    return 0
+    return _program_csv_index(ctx, var, name)
 
 def b_erdname(ctx, args):
     var = _raw_identifier_text(arg(args, 0))
@@ -499,8 +497,20 @@ def b_erdname(ctx, args):
     return getter(var, index, dimension) if callable(getter) else ""
 
 def _csv_index(ctx, var: str, name: str) -> int:
+    return _program_csv_index(ctx, var, name)
+
+def _program_csv_index(ctx, var: str, name: str) -> int:
     db = getattr(ctx.program, "csv", None)
-    return db.resolve_index(var, name) if db else 0
+    if not db:
+        return 0
+    program = getattr(ctx, "program", None)
+    key = (norm_name(var), norm_name(str(name)))
+    cache = getattr(program, "_csv_index_cache", None)
+    if cache is None:
+        return db.resolve_index(var, name)
+    if key not in cache:
+        cache[key] = db.resolve_index(var, name)
+    return cache[key]
 
 def _script_index(ctx, var: str, name: str) -> int:
     """Resolve a bare CSV-name segment as the expression parser would.
@@ -519,10 +529,7 @@ def _script_index(ctx, var: str, name: str) -> int:
             return to_int(_ctx_get_var(ctx, name, []))
     except Exception:
         pass
-    db = getattr(ctx.program, "csv", None)
-    if not db:
-        return 0
-    return db.resolve_index(var, name)
+    return _program_csv_index(ctx, var, name)
 
 def _csv_name(ctx, var: str, index: int) -> str:
     db = getattr(ctx.program, "csv", None)
@@ -533,7 +540,13 @@ def _has_csv_name(ctx, var: str, name: str) -> bool:
     if not db:
         return False
     key = norm_name(var)
-    return norm_name(name) in db.name_to_index.get(key, {}) or norm_name(f"{key}:{name}") in db.constants
+    cache_key = (key, norm_name(name))
+    cache = getattr(getattr(ctx, "program", None), "_csv_name_presence_cache", None)
+    if cache is None:
+        return norm_name(name) in db.name_to_index.get(key, {}) or norm_name(f"{key}:{name}") in db.constants
+    if cache_key not in cache:
+        cache[cache_key] = norm_name(name) in db.name_to_index.get(key, {}) or norm_name(f"{key}:{name}") in db.constants
+    return cache[cache_key]
 
 def _offset_num(ctx, args, var: str, anchor: str) -> int | None:
     if not _has_csv_name(ctx, var, anchor):
@@ -8830,7 +8843,21 @@ def _print_img_placeholder(ctx, name: str) -> None:
                 next_line() if callable(next_line) else 1,
                 len(current_line()) if callable(current_line) else 0,
             )
-        _write_plain(ctx, f"[IMG:{name}]", newline=False)
+        # Keep the marker in the plain transcript for CLI/debug compatibility,
+        # but never register it as styled GUI text.  Native WRITE_IMG reaches
+        # this helper instead of the PRINT_IMG command path; recording the
+        # marker here made every transparent portrait slice reveal a literal
+        # ``[IMG:...]`` label underneath the actual sprite.
+        write = getattr(ctx, "_write", None)
+        if callable(write):
+            write(
+                f"[IMG:{name}]",
+                newline=False,
+                harvest_buttons=False,
+                record_style=False,
+            )
+        else:
+            _message_write(ctx, f"[IMG:{name}]", newline=False)
 
 
 def _print_rect_placeholder(ctx, width: int) -> None:

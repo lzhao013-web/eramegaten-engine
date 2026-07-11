@@ -12,11 +12,18 @@ class EraFormatter:
     context: object
 
     def render_form(self, text: str, *, render_braces: bool = True) -> str:
-        text = self._render_conditionals(text)
-        if render_braces:
+        # Most real command/function targets are plain identifiers or already
+        # concrete text.  Avoid rescanning them through every FORM pass; keep the
+        # slower paths only when their marker can actually appear.
+        if "\\@" in text:
+            text = self._render_conditionals(text)
+        if render_braces and "{" in text:
             text = self._render_braces(text)
-        text = self._render_percents(text)
-        return self._unescape_form_text(text)
+        if "%" in text:
+            text = self._render_percents(text)
+        if "\\" in text:
+            text = self._unescape_form_text(text)
+        return text
 
     def _render_conditionals(self, text: str) -> str:
         # Handles \@ cond ? true # false \@.  This is a form-string feature and

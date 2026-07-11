@@ -6,9 +6,11 @@ import sys
 import time
 import json
 import struct
+import math
 import html as html_lib
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,7 @@ from .native_save import (
 
 
 _NATIVE_SAVE_MAGIC = b"\x89ERA\r\n\x1a\n"
+_NUMERIC_CHOICE_RE = re.compile(r"\[\s*([+-]?\d{1,6})\s*\]")
 
 
 @dataclass(slots=True)
@@ -60,6 +63,12 @@ class EraFatalError(Exception):
 
 
 class EraRuntime:
+    TRY_CATCH_KEYS = {
+        "TRYCALL", "TRYCCALL", "TRYCALLFORM", "TRYCCALLFORM",
+        "TRYJUMP", "TRYCJUMP", "TRYJUMPFORM", "TRYCJUMPFORM",
+        "TRYGOTO", "TRYCGOTO", "TRYGOTOFORM", "TRYCGOTOFORM",
+    }
+
     def __init__(
         self,
         program: Program,
@@ -68,6 +77,7 @@ class EraRuntime:
         interactive: bool = True,
         inputs: list[str] | None = None,
         state_dir: str | Path | None = None,
+        pause_on_input: bool = False,
     ):
         self.program = program
         self.memory = Memory(program)
@@ -75,7 +85,13 @@ class EraRuntime:
         self.echo = echo
         self.interactive = interactive
         self.inputs = list(inputs or [])
-        self.had_explicit_inputs = bool(inputs)
+        # GUI/front-end adapters need the non-interactive runtime to stop at
+        # every input boundary even before the user has submitted the first
+        # value.  Historically this behaviour was only enabled after a replay
+        # supplied at least one queued input; expose it explicitly so a live
+        # front end does not need to mutate ``had_explicit_inputs`` directly.
+        self.had_explicit_inputs = bool(inputs) or bool(pause_on_input)
+        self.pause_on_input = bool(pause_on_input)
         self.state_dir = Path(state_dir) if state_dir is not None else program.root / ".eramegaten_engine_saves"
         self.stack: list[ExecFrame] = []
         self.output: list[str] = []
@@ -91,6 +107,7 @@ class EraRuntime:
         self.html_nonbuttons: list[dict[str, str]] = []
         self.html_text_runs: list[dict[str, Any]] = []
         self.print_buttons: list[dict[str, Any]] = []
+        self.implicit_buttons: list[dict[str, Any]] = []
         self.print_images: list[dict[str, Any]] = []
         self.print_rects: list[dict[str, Any]] = []
         self.print_spaces: list[dict[str, Any]] = []
@@ -101,17 +118,20 @@ class EraRuntime:
         self._html_nonbutton_lines: list[int] = []
         self._html_text_lines: list[int] = []
         self._print_button_lines: list[int] = []
+        self._implicit_button_lines: list[int] = []
         self._print_rect_lines: list[int] = []
         self._print_space_lines: list[int] = []
         self._html_button_styles: list[dict[str, Any]] = []
         self._html_image_styles: list[dict[str, Any]] = []
         self._html_nonbutton_styles: list[dict[str, Any]] = []
         self._print_button_styles: list[dict[str, Any]] = []
+        self._implicit_button_styles: list[dict[str, Any]] = []
         self._print_rect_styles: list[dict[str, Any]] = []
         self._print_space_styles: list[dict[str, Any]] = []
         self._print_image_lines: list[int] = []
         self._html_visual_line_extra = 0
         self._html_raw_line_breaks: dict[int, int] = {}
+        self._html_raw_lines: set[int] = set()
         self.printc_counter = 0
         self.max_call_depth = 200
         self.current_redraw = 1
@@ -124,7 +144,11 @@ class EraRuntime:
         self.mouse_skip = False
         self.output_log_files: list[str] = []
         self.save_info_lines: list[str] = []
-        self.default_font = "ＭＳ ゴシック"
+        # Emuera's text renderer takes the default face from emuera.config.
+        # Keeping the configured family in every recorded span is important:
+        # substituting even another monospace CJK face changes glyph bearings,
+        # center alignment and character-art columns.
+        self.default_font = _config_raw(self, "フォント名").strip() or "ＭＳ ゴシック"
         self.current_font = self.default_font
         self.current_font_style = 0
         self.default_color = _parse_rgb_config(_config_raw(self, "文字色"), 0xC0C0C0)
@@ -161,7 +185,15 @@ class EraRuntime:
         self.graphics: dict[int, dict[str, Any]] = {}
         self.sprites: dict[str, dict[str, Any]] = {}
         self._resource_sprites: dict[str, dict[str, Any]] | None = None
+        self._has_callable_cache: dict[str, bool] = {}
         self._ordered_function_cache: dict[str, list[EraFunction]] = {}
+        self._frame_decl_cache: dict[int, tuple[Any, ...]] = {}
+        self._ref_param_cache: dict[int, set[int]] = {}
+        self._try_catch_cache: dict[tuple[int, int], int | None] = {}
+        self._catch_end_cache: dict[tuple[int, int], int] = {}
+        self._matching_cache: dict[tuple[int, int, tuple[str, ...]], int] = {}
+        self._if_branch_cache: dict[tuple[int, int], tuple[tuple[tuple[int, str, str], ...], int]] = {}
+        self._case_branch_cache: dict[tuple[int, int], tuple[tuple[tuple[int, str, str], ...], int]] = {}
         self._paused_native_input_many: dict[str, Any] | None = None
         self._paused_native_input_select: tuple[str, ...] | None = None
         self._paused_native_input_select_menu: tuple[str, ...] | None = None
@@ -188,7 +220,11 @@ class EraRuntime:
 
     def has_callable(self, name: str) -> bool:
         key = norm_name(name)
-        return bool(self._ordered_functions(key)) or key in BUILTINS
+        cached = self._has_callable_cache.get(key)
+        if cached is None:
+            cached = bool(self._ordered_functions(key)) or key in BUILTINS
+            self._has_callable_cache[key] = cached
+        return cached
 
     def index_segment_should_evaluate(self, name: str) -> bool:
         return self.memory.index_segment_should_evaluate(name)
@@ -442,11 +478,7 @@ class EraRuntime:
             fr.dims["LOCAL"] = (max(0, to_int(eval_expr(self, fn.local_size_expr, default=0))),)
         if fn.locals_size_expr:
             fr.dims["LOCALS"] = (max(0, to_int(eval_expr(self, fn.locals_size_expr, default=0))),)
-        for line in fn.lines:
-            text = line.text.strip()
-            decl = parse_var_decl(text)
-            if not decl:
-                continue
+        for decl in self._frame_decls(fn):
             key = norm_name(decl.name)
             dims = self._resolve_local_decl_dims(decl)
             fr.dims[key] = dims
@@ -471,6 +503,24 @@ class EraRuntime:
                 self.memory.set_var(decl.name, [i], value)
             if values and not dims:
                 self.memory.set_var(decl.name, [], values[0])
+
+    def _frame_decls(self, fn: EraFunction) -> tuple[Any, ...]:
+        cache_key = id(fn)
+        cached = self._frame_decl_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        decls = []
+        for line in fn.lines:
+            text = line.text.strip()
+            upper = text.upper()
+            if not (upper.startswith("#DIM") or upper.startswith("#DIMS")):
+                continue
+            decl = parse_var_decl(text)
+            if decl:
+                decls.append(decl)
+        cached = tuple(decls)
+        self._frame_decl_cache[cache_key] = cached
+        return cached
 
     def _resolve_local_decl_dims(self, decl) -> tuple[int, ...]:
         if getattr(decl, "dim_exprs", ()):
@@ -603,8 +653,7 @@ class EraRuntime:
         if self._display_suppressed():
             return
         if harvest_buttons and not self.interactive:
-            for m in re.finditer(r"\[\s*([+-]?\d{1,6})\s*\]", text):
-                self.pending_buttons.append(m.group(1))
+            self._record_implicit_numeric_buttons(text)
         if record_style:
             self._record_output_text(text, newline=newline)
         if newline:
@@ -615,6 +664,34 @@ class EraRuntime:
             self.output.append(text)
             if self.echo:
                 print(text, end="")
+
+    def _record_implicit_numeric_buttons(self, text: str) -> None:
+        """Track currently active plain ``[number]`` menu markers by row.
+
+        Inferring them later from the entire transcript reactivated historical
+        menu rows whenever a new menu reused the same number.  Record the
+        marker at write time instead, then clear it at the same input boundary
+        as PRINTBUTTON metadata.
+        """
+
+        if text == "":
+            return
+        display_line = self._next_visual_write_start_line()
+        initial_col = self._current_line_col()
+        style = self._style_snapshot()
+        for index, segment in enumerate(text.split("\n")):
+            base_col = initial_col if index == 0 else 0
+            for match in _NUMERIC_CHOICE_RE.finditer(segment):
+                value = match.group(1)
+                self.pending_buttons.append(value)
+                self.implicit_buttons.append(
+                    {
+                        "value": value,
+                        "col": base_col + self._layout_text_width(segment[: match.start()]),
+                    }
+                )
+                self._implicit_button_lines.append(display_line + index)
+                self._implicit_button_styles.append(dict(style))
 
     def _style_snapshot(self) -> dict[str, Any]:
         return {
@@ -685,6 +762,7 @@ class EraRuntime:
         self.html_nonbuttons.clear()
         self.html_text_runs.clear()
         self.print_buttons.clear()
+        self.implicit_buttons.clear()
         self.print_images.clear()
         self.print_rects.clear()
         self.print_spaces.clear()
@@ -693,12 +771,14 @@ class EraRuntime:
         self._html_nonbutton_lines.clear()
         self._html_text_lines.clear()
         self._print_button_lines.clear()
+        self._implicit_button_lines.clear()
         self._print_rect_lines.clear()
         self._print_space_lines.clear()
         self._html_button_styles.clear()
         self._html_image_styles.clear()
         self._html_nonbutton_styles.clear()
         self._print_button_styles.clear()
+        self._implicit_button_styles.clear()
         self._print_rect_styles.clear()
         self._print_space_styles.clear()
         self._print_image_lines.clear()
@@ -734,7 +814,14 @@ class EraRuntime:
         rows expose both 0-based `index` and 1-based `display_line`.
         """
 
-        display_lines = self._display_lines()
+        raw_display_lines = self._display_lines()
+        display_lines: list[str] = []
+        for raw_line, value in enumerate(raw_display_lines, start=1):
+            # HTML_PRINT keeps its markup in the terminal transcript only.
+            # The GUI row is populated by parsed html_text/buttons/images and
+            # must never show the raw ``<button ...>`` source as a second row.
+            display_lines.append("" if raw_line in self._html_raw_lines else value)
+            display_lines.extend("" for _ in range(self._html_raw_line_breaks.get(raw_line, 0)))
         max_line = len(display_lines)
         line_sources: list[int] = []
         line_sources.extend(self._html_button_lines)
@@ -742,6 +829,7 @@ class EraRuntime:
         line_sources.extend(self._html_nonbutton_lines)
         line_sources.extend(self._html_text_lines)
         line_sources.extend(self._print_button_lines)
+        line_sources.extend(self._implicit_button_lines)
         line_sources.extend(self._print_rect_lines)
         line_sources.extend(self._print_space_lines)
         line_sources.extend(self._print_image_lines)
@@ -763,6 +851,7 @@ class EraRuntime:
                     "nonbuttons": [],
                     "html_text": [],
                     "print_buttons": [],
+                    "implicit_buttons": [],
                     "print_rects": [],
                     "print_spaces": [],
                     "print_images": [],
@@ -784,6 +873,7 @@ class EraRuntime:
                         "nonbuttons": [],
                         "html_text": [],
                         "print_buttons": [],
+                        "implicit_buttons": [],
                         "print_rects": [],
                         "print_spaces": [],
                         "print_images": [],
@@ -839,6 +929,12 @@ class EraRuntime:
             "nonbuttons": attach(self.html_nonbuttons, self._html_nonbutton_lines, "nonbuttons", self._html_nonbutton_styles),
             "html_text": attach(self.html_text_runs, self._html_text_lines, "html_text"),
             "print_buttons": attach(self.print_buttons, self._print_button_lines, "print_buttons", self._print_button_styles),
+            "implicit_buttons": attach(
+                self.implicit_buttons,
+                self._implicit_button_lines,
+                "implicit_buttons",
+                self._implicit_button_styles,
+            ),
             "print_rects": attach(self.print_rects, self._print_rect_lines, "print_rects", self._print_rect_styles),
             "print_spaces": attach(self.print_spaces, self._print_space_lines, "print_spaces", self._print_space_styles),
             "print_images": attach(self.print_images, self._print_image_lines, "print_images"),
@@ -858,7 +954,8 @@ class EraRuntime:
         layout engine.  It preserves Emuera HTML metadata and maps the pieces
         eraMegaten actually relies on to coordinates:
 
-        * display row -> ``y = line * line_height``
+        * display rows flow vertically at ``line_height`` and expand to the
+          tallest inline image/PRINT_IMG slice on that row
         * ``pos`` / parent ``pos`` -> x coordinate
         * ``ypos`` -> image y offset from the row baseline
         * explicit ``width/height`` fall back to natural sprite size
@@ -912,6 +1009,32 @@ class EraRuntime:
         def html_unit_attr(value: Any, default: int = 0) -> int:
             return int(round(int_attr(value, default) * html_scale))
 
+        def print_image_sized(element: dict[str, Any]) -> tuple[int, int, bool]:
+            """Resolve PRINT_IMG geometry once for flow and painting.
+
+            PRINT_IMG sprites are commonly horizontal slices of a portrait.
+            Their real height contributes to Emuera's visual line box; using
+            the configured 18px text row for every slice makes consecutive
+            pieces overlap and produces the corrupted gray blocks previously
+            visible in dungeon/formation screens.
+            """
+
+            source = to_str(element.get("src", ""))
+            width = int_attr(element.get("width"))
+            height = int_attr(element.get("height"))
+            asset_missing = False
+            if width <= 0 or height <= 0:
+                natural_width, natural_height = self._sprite_dimensions(source)
+                width = width or natural_width
+                height = height or natural_height
+            if width <= 0:
+                width = max(char_width, self._layout_text_width(f"[IMG:{source}]") * char_width)
+                asset_missing = True
+            if height <= 0:
+                height = line_height
+                asset_missing = True
+            return max(0, width), max(0, height), asset_missing
+
         rows: list[dict[str, Any]] = []
         drawables: list[dict[str, Any]] = []
         row_cursors: dict[int, int] = {}
@@ -924,14 +1047,28 @@ class EraRuntime:
             max_x = max(max_x, int_attr(item.get("x")) + int_attr(item.get("width")))
             max_y = max(max_y, int_attr(item.get("y")) + int_attr(item.get("height")))
 
+        next_row_y = 0
         for row in page["lines"]:
             line_index = int_attr(row.get("index"))
-            base_y = line_index * line_height
+            row_height = line_height
+            for image in row.get("images", []):
+                if not isinstance(image, dict):
+                    continue
+                _image_width, image_height = sized(image)
+                image_y = html_unit_attr(image.get("ypos"), 0)
+                row_height = max(row_height, max(0, image_y) + image_height)
+            for image in row.get("print_images", []):
+                if not isinstance(image, dict):
+                    continue
+                _image_width, image_height, _missing = print_image_sized(image)
+                row_height = max(row_height, image_height)
+            base_y = next_row_y
+            next_row_y += row_height
             row_model = {
                 "index": line_index,
                 "display_line": row.get("display_line", line_index + 1),
                 "y": base_y,
-                "height": line_height,
+                "height": row_height,
                 "text": row.get("text", ""),
                 "style_spans": row.get("style_spans", []),
             }
@@ -958,6 +1095,23 @@ class EraRuntime:
                         "cells": fallback_cells,
                         "target_width": max(0, width),
                         "index": image_index,
+                    }
+                )
+            html_image_count = len(row_image_spaces)
+            for image_index, image in enumerate(row.get("print_images", [])):
+                if not isinstance(image, dict):
+                    continue
+                source = to_str(image.get("src", ""))
+                width, _height, _missing = print_image_sized(image)
+                # The plain transcript stores ``[IMG:name]`` only as a marker;
+                # subsequent spans must advance by the actual sprite width.
+                fallback_cells = max(1, self._layout_text_width(f"[IMG:{source}]"))
+                row_image_spaces.append(
+                    {
+                        "col": max(0, int_attr(image.get("col"))),
+                        "cells": fallback_cells,
+                        "target_width": max(0, width),
+                        "index": html_image_count + image_index,
                     }
                 )
             row_image_spaces.sort(key=lambda space: (space["col"], space["index"]))
@@ -1037,7 +1191,7 @@ class EraRuntime:
                             "explicit_x": False,
                         }
                     )
-            elif text and not row.get("html"):
+            elif text and not row.get("html") and not row.get("print_images"):
                 add_drawable(
                     {
                         "type": "text",
@@ -1069,6 +1223,7 @@ class EraRuntime:
                         "height": line_height,
                         "value": button.get("value", ""),
                         "label": label,
+                        "activate_empty": bool(button.get("activate_empty", False)),
                         "color": int_attr(button.get("color"), self.current_color),
                         "bgcolor": int_attr(button.get("bgcolor"), self.current_bgcolor),
                         "font": button.get("font", self.current_font),
@@ -1213,8 +1368,8 @@ class EraRuntime:
                 )
                 cursor = max(cursor, x + width)
             for image in row.get("print_images", []):
-                width = int_attr(image.get("width"))
-                height = int_attr(image.get("height"), line_height)
+                source = to_str(image.get("src", ""))
+                width, height, asset_missing = print_image_sized(image)
                 x = adjusted_x_for_col(image.get("col")) if "col" in image else 0
                 add_drawable(
                     {
@@ -1225,11 +1380,66 @@ class EraRuntime:
                         "y": base_y,
                         "width": width,
                         "height": height,
-                        "src": image.get("src", ""),
+                        "src": source,
+                        "asset_missing": asset_missing,
                         "explicit_x": False,
                     }
                 )
                 cursor = max(cursor, x + width)
+
+            # Classic Era scripts frequently render menus with PRINT/PRINTL
+            # instead of PRINTBUTTON.  Only metadata harvested since the most
+            # recent input boundary is active; old transcript rows stay plain.
+            active_implicit = sorted(
+                [button for button in row.get("implicit_buttons", []) if isinstance(button, dict)],
+                key=lambda button: int_attr(button.get("col")),
+            )
+            if text and not row.get("html") and active_implicit:
+                explicit_ranges: list[tuple[int, int]] = []
+                for explicit in row.get("print_buttons", []):
+                    start = max(0, int_attr(explicit.get("col")))
+                    explicit_ranges.append((start, start + self._layout_text_width(to_str(explicit.get("label", "")))))
+                for explicit in row.get("buttons", []):
+                    if "col" not in explicit:
+                        continue
+                    start = max(0, int_attr(explicit.get("col")))
+                    explicit_ranges.append((start, start + self._layout_text_width(to_str(explicit.get("label", "")))))
+
+                row_width = self._layout_text_width(text.rstrip())
+                for button_index, button in enumerate(active_implicit):
+                    value = to_str(button.get("value", ""))
+                    start_col = max(0, int_attr(button.get("col")))
+                    if any(start <= start_col < end for start, end in explicit_ranges):
+                        continue
+                    end_col = (
+                        max(start_col + 1, int_attr(active_implicit[button_index + 1].get("col")))
+                        if button_index + 1 < len(active_implicit)
+                        else max(start_col + self._layout_text_width(f"[{value}]"), row_width)
+                    )
+                    width = max(char_width, (end_col - start_col) * char_width)
+                    style = {
+                        "color": int_attr(button.get("color"), self.current_color),
+                        "bgcolor": int_attr(button.get("bgcolor"), self.current_bgcolor),
+                        "font": button.get("font", self.current_font),
+                        "font_style": int_attr(button.get("font_style"), 0),
+                        "alignment": button.get("alignment", ""),
+                        **tooltip_attrs(button),
+                    }
+                    add_drawable(
+                        {
+                            "type": "implicit_button",
+                            "line": line_index,
+                            "display_line": row_model["display_line"],
+                            "x": adjusted_x_for_col(start_col),
+                            "y": base_y,
+                            "width": width,
+                            "height": line_height,
+                            "value": value,
+                            "label": f"[{value}]",
+                            **style,
+                            "explicit_x": False,
+                        }
+                    )
             row_cursors[line_index] = cursor
 
         def expand_html_control_bounds() -> None:
@@ -1313,13 +1523,14 @@ class EraRuntime:
         for item in drawables:
             max_x = max(max_x, int_attr(item.get("x")) + int_attr(item.get("width")))
             max_y = max(max_y, int_attr(item.get("y")) + int_attr(item.get("height")))
-        max_y = max(max_y, len(rows) * line_height)
+        max_y = max(max_y, next_row_y)
         return {
             "page": page,
             "rows": rows,
             "drawables": drawables,
             "texts": [d for d in drawables if d.get("type") == "text"],
             "buttons": [d for d in drawables if d.get("type") == "button"],
+            "implicit_buttons": [d for d in drawables if d.get("type") == "implicit_button"],
             "print_buttons": [d for d in drawables if d.get("type") == "print_button"],
             "print_rects": [d for d in drawables if d.get("type") == "print_rect"],
             "print_spaces": [d for d in drawables if d.get("type") == "print_space"],
@@ -1374,12 +1585,15 @@ class EraRuntime:
             if not (ix <= px < ix + width and iy <= py < iy + height):
                 continue
             hit = dict(item)
-            if hit.get("type") in {"button", "print_button"}:
+            if hit.get("type") in {"button", "print_button", "implicit_button"}:
                 hit["button_value"] = to_str(hit.get("value", ""))
+                hit["clickable"] = bool(hit.get("button_value")) or bool(hit.get("activate_empty"))
             elif hit.get("type") == "image" and hit.get("parent") == "button":
                 hit["button_value"] = to_str(hit.get("parent_value", ""))
+                hit["clickable"] = bool(hit.get("button_value"))
             else:
                 hit["button_value"] = ""
+                hit["clickable"] = False
             return hit
         return None
 
@@ -1417,13 +1631,13 @@ class EraRuntime:
             iy = to_int(item.get("y", 0))
             if not (ix <= px < ix + width and iy <= py < iy + height):
                 continue
-            if item.get("type") in {"button", "print_button"}:
+            if item.get("type") in {"button", "print_button", "implicit_button"}:
                 value = to_str(item.get("value", ""))
             elif item.get("type") == "image" and item.get("parent") == "button":
                 value = to_str(item.get("parent_value", ""))
             else:
                 value = ""
-            if value != "":
+            if value != "" or bool(item.get("activate_empty")):
                 return value
         return None
 
@@ -1550,6 +1764,11 @@ class EraRuntime:
             self._print_button_lines,
             self._print_button_styles,
         )
+        self.implicit_buttons, self._implicit_button_lines, self._implicit_button_styles = _filter_elements_with_styles(
+            self.implicit_buttons,
+            self._implicit_button_lines,
+            self._implicit_button_styles,
+        )
         self.print_rects, self._print_rect_lines, self._print_rect_styles = _filter_elements_with_styles(
             self.print_rects,
             self._print_rect_lines,
@@ -1572,12 +1791,14 @@ class EraRuntime:
             self.output.clear()
             self._html_visual_line_extra = 0
             self._html_raw_line_breaks.clear()
+            self._html_raw_lines.clear()
             self._trim_text_spans_to_line_count(0)
             self._trim_html_to_line_count(0)
             self._clear_visible_buttons()
             return
         self.output = ["".join(lines[:-count])]
         keep_lines = len(lines) - count
+        self._html_raw_lines = {line for line in self._html_raw_lines if line <= keep_lines}
         removed_extra = 0
         for raw_line in list(self._html_raw_line_breaks):
             if raw_line > keep_lines:
@@ -1592,6 +1813,9 @@ class EraRuntime:
         # accidentally click stale buttons from menus that eraMegaten has just
         # redrawn or hidden (notably MESSAGE_WINDOW_D's temporary dungeon UI).
         self.pending_buttons.clear()
+        self.implicit_buttons.clear()
+        self._implicit_button_lines.clear()
+        self._implicit_button_styles.clear()
 
     def _input(self, default: str = "") -> str:
         if self.inputs:
@@ -1643,6 +1867,17 @@ class EraRuntime:
         self._record_timed_wait("FORCEWAIT", 0, allow_skip=False)
         if self.interactive or self.inputs:
             self._input("")
+
+    def _exec_wait(self, key: str) -> bool:
+        if self.interactive or self.inputs:
+            self._record_timed_wait(key, 0, allow_skip=False)
+            self._input("")
+            return True
+        if not self.interactive and self.had_explicit_inputs:
+            self.waiting_for_input = True
+            return False
+        self._record_timed_wait(key, 0, allow_skip=False)
+        return True
 
     def _record_timed_input_wait(self, key: str, rest: str) -> None:
         if key not in {"TINPUT", "TINPUTS", "TONEINPUT", "TONEINPUTS"}:
@@ -1745,7 +1980,8 @@ class EraRuntime:
 
     # ---- line execution ---------------------------------------------------
     def _execute_line(self, frame: ExecFrame, src: SourceLine) -> None:
-        text = src.text.strip(" \t\r\n")
+        command_text = src.text.lstrip(" \t").rstrip("\r\n")
+        text = command_text.strip(" \t")
         if not text.strip() or text.startswith(";"):
             frame.pc += 1
             return
@@ -1753,6 +1989,14 @@ class EraRuntime:
             frame.pc += 1
             return
         key, rest = self._keyword(text)
+        if self._is_print_key(key):
+            # Emuera consumes one whitespace character as the command
+            # delimiter, but additional leading spaces and trailing spaces are
+            # literal PRINT content.  Collapsing all whitespace destroyed the
+            # indentation in title logos and character art.
+            match = re.match(r"\S+", command_text)
+            suffix = command_text[match.end() :] if match else ""
+            rest = suffix[1:] if suffix.startswith((" ", "\t")) else suffix
 
         # Control flow first.
         if key == "SIF":
@@ -1854,11 +2098,11 @@ class EraRuntime:
             return
         if key in {"TRYGOTO", "TRYCGOTO"}:
             label = norm_name(rest.strip().lstrip("$"))
-            frame.pc = self._jump_target_pc(frame, frame.fn.labels.get(label, frame.pc + 1))
+            self._exec_try_goto(frame, label)
             return
         if key in {"TRYGOTOFORM", "TRYCGOTOFORM"}:
             label = norm_name(self.render_form(rest).strip().lstrip("$"))
-            frame.pc = self._jump_target_pc(frame, frame.fn.labels.get(label, frame.pc + 1))
+            self._exec_try_goto(frame, label)
             return
         if key == "JUMP":
             target, args = self._parse_call(rest)
@@ -1941,14 +2185,15 @@ class EraRuntime:
 
         if key in {"DRAWLINE", "CUSTOMDRAWLINE", "DRAWLINEFORM"}:
             fill = self._drawline_fill(key, rest)
-            self._write((fill * 72)[:72], newline=True)
+            self._write(self._drawline_text(fill), newline=True)
             frame.pc += 1
             return
 
         # Variables may legally start with command names (e.g. PRINT_MODE).
         # Give top-level assignments priority before PRINT*/HTML_PRINT command
         # dispatch so apostrophe assignment does not get rendered as text.
-        if find_assignment(text) and self._try_assignment(text):
+        found_assignment = find_assignment(text)
+        if found_assignment and self._try_assignment(text, found_assignment):
             frame.pc += 1
             return
 
@@ -1982,10 +2227,7 @@ class EraRuntime:
             frame.pc += 1
             return
         if key in {"WAIT", "WAITANYKEY"}:
-            if self.interactive or (key == "WAITANYKEY" and self.inputs):
-                self._input("")
-            elif key == "WAITANYKEY" and not self.interactive and self.had_explicit_inputs:
-                self.waiting_for_input = True
+            if not self._exec_wait(key):
                 return
             frame.pc += 1
             return
@@ -2096,7 +2338,7 @@ class EraRuntime:
         if key == "GETTIME":
             now = int(time.time() * 1000)
             self.memory.set_var("RESULT", [], now)
-            self.memory.set_var("RESULTS", [], str(now))
+            self.memory.set_var("RESULTS", [], time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now / 1000)))
             frame.pc += 1
             return
         if key == "SAVENOS":
@@ -2505,6 +2747,10 @@ class EraRuntime:
         return out
 
     def _ref_param_positions(self, fn: EraFunction) -> set[int]:
+        cache_key = id(fn)
+        cached = self._ref_param_cache.get(cache_key)
+        if cached is not None:
+            return cached
         ref_names: set[str] = set()
         for line in fn.lines[: max(12, len(fn.params) + 4)]:
             raw = line.text.strip()
@@ -2521,6 +2767,7 @@ class EraRuntime:
                 continue
             if norm_name(ref.base) in ref_names:
                 out.add(i)
+        self._ref_param_cache[cache_key] = out
         return out
 
     def _clean_param_text(self, param: str) -> str:
@@ -3365,18 +3612,42 @@ class EraRuntime:
         signature = (key,) + tuple(to_str(a) for a in tap_args)
         resume = getattr(self, "_paused_native_input_onekey", None) == signature
         if not resume:
+            def write_control_row(
+                row: str,
+                controls: list[tuple[str, str, bool]],
+            ) -> None:
+                line = self._next_visual_write_start_line()
+                search_from = 0
+                for label, value, activate_empty in controls:
+                    offset = row.find(label, search_from)
+                    if offset < 0:
+                        continue
+                    self._record_print_button(
+                        label,
+                        value,
+                        line,
+                        self._layout_text_width(row[:offset]),
+                        activate_empty=activate_empty,
+                    )
+                    search_from = offset + len(label)
+                self._write(row, newline=True)
+
             self._write((line_char * 72)[:72], newline=True)
             if wasd:
-                self._write("　　[W]　　", newline=True)
-                self._write("　[A]┼[D]　", newline=True)
-                self._write("　　[S]　　", newline=True)
+                write_control_row("　　[W]　　", [("[W]", "w", False)])
+                write_control_row("　[A]┼[D]　", [("[A]", "a", False), ("[D]", "d", False)])
+                write_control_row("　　[S]　　", [("[S]", "s", False)])
             else:
-                self._write("　　[8]　　", newline=True)
-                self._write("　[4]┼[6]　", newline=True)
-                self._write("　　[2]　　", newline=True)
-            labels = [f"[{button}]{tag}" for _, button, tag, _ in entries if button or tag]
+                write_control_row("　　[8]　　", [("[8]", "8", False)])
+                write_control_row("　[4]┼[6]　", [("[4]", "4", False), ("[6]", "6", False)])
+                write_control_row("　　[2]　　", [("[2]", "2", False)])
+            visible_entries = [(entry_key, f"[{button}]{tag}") for entry_key, button, tag, _ in entries if button or tag]
+            labels = [label for _, label in visible_entries]
             if labels:
-                self._write(" ".join(labels), newline=True)
+                write_control_row(
+                    " ".join(labels),
+                    [(label, entry_key, entry_key == "") for entry_key, label in visible_entries],
+                )
             self._write((line_char * 72)[:72], newline=True)
 
         allowed = ("wasdWASD" if wasd else "8462") + "".join(entry_key for entry_key, _, _, _ in entries)
@@ -3923,12 +4194,21 @@ class EraRuntime:
         else:
             frame.pc += 1
 
+    def _exec_try_goto(self, frame: ExecFrame, label: str) -> None:
+        target_pc = frame.fn.labels.get(label)
+        if target_pc is not None:
+            frame.pc = self._jump_target_pc(frame, target_pc)
+            return
+        catch_pc = self._find_catch_for_try(frame, frame.pc)
+        frame.pc = catch_pc + 1 if catch_pc is not None else frame.pc + 1
+
     def _exec_try_jump(self, frame: ExecFrame, target: str, args: list[Value]) -> None:
         if self._ordered_functions(target):
             self._return()
             self._push_call_sequence(target, args, try_only=True)
         else:
-            frame.pc += 1
+            catch_pc = self._find_catch_for_try(frame, frame.pc)
+            frame.pc = catch_pc + 1 if catch_pc is not None else frame.pc + 1
 
     def _exec_try_list(self, frame: ExecFrame, key: str) -> None:
         """Execute private-Emuera TRYCALLLIST/TRYJUMPLIST/TRYGOTOLIST blocks.
@@ -4111,7 +4391,17 @@ class EraRuntime:
                 name = to_str(eval_expr(self, rest, default=self.render_form(rest) if ("%" in rest or "{" in rest or "\\@" in rest) else rest)).strip()
                 if name:
                     self._record_print_img(name, self._next_visual_write_start_line(), self._current_line_col())
-                    self._write(f"[IMG:{name}]", newline=False)
+                    # Keep the marker in the plain transcript, but do not turn
+                    # it into a GUI text span underneath the real sprite.  A
+                    # transparent PNG would otherwise reveal ``[IMG:...]``
+                    # through its alpha channel and every sliced portrait row
+                    # would be painted twice.
+                    self._write(
+                        f"[IMG:{name}]",
+                        newline=False,
+                        harvest_buttons=False,
+                        record_style=False,
+                    )
                 return
             if key.startswith("PRINTBUTTON"):
                 args = split_era_args(rest)
@@ -4475,6 +4765,7 @@ class EraRuntime:
 
         visual_end = max(visual_start, visual_start + len(br_positions))
         self._html_fragments.append((visual_start, visual_end, text))
+        self._html_raw_lines.update(range(max(1, int(start_line)), max(1, int(end_line)) + 1))
         self.html_output.append(text)
         control_positions, image_positions = self._record_html_text_runs(text, visual_start, visual_col)
         img_parents: list[tuple[int, int, str, dict[str, str]]] = []
@@ -4571,10 +4862,57 @@ class EraRuntime:
             self._html_raw_line_breaks[start_line] = self._html_raw_line_breaks.get(start_line, 0) + count
 
     def _sprite_dimension_strings(self, name: str) -> tuple[str, str]:
+        width, height = self._sprite_dimensions(name)
+        if width <= 0 and height <= 0:
+            return "", ""
+        return str(width), str(height)
+
+    def _sprite_dimensions(self, name: str) -> tuple[int, int]:
+        """Resolve explicit or natural dimensions for a sprite.
+
+        Emuera resource CSV files use zero width/height to mean "the remaining
+        source bitmap".  Returning the literal zero made PRINT_IMG drawables
+        disappear in the Qt canvas even though render_sprite_image() could
+        materialize them correctly.  Resolve that convention before recording
+        layout metadata, for both file-backed and runtime graphic sprites.
+        """
+
         info = self._sprite_info(name) or {}
         if not info:
-            return "", ""
-        return str(to_int(info.get("width", 0))), str(to_int(info.get("height", 0)))
+            return 0, 0
+        width = max(0, to_int(info.get("width", 0)))
+        height = max(0, to_int(info.get("height", 0)))
+        x = max(0, to_int(info.get("x", 0)))
+        y = max(0, to_int(info.get("y", 0)))
+        natural_width = 0
+        natural_height = 0
+        if "graphic" in info:
+            graphic = self.graphics.get(to_int(info.get("graphic", 0)), {})
+            natural_width = max(0, to_int(graphic.get("width", 0)))
+            natural_height = max(0, to_int(graphic.get("height", 0)))
+            source = to_str(graphic.get("source", ""))
+            if (natural_width <= 0 or natural_height <= 0) and source:
+                path = Path(source)
+                if path.is_file():
+                    natural_width, natural_height = self._read_image_size(path)
+        elif "file" in info:
+            cached_size = info.get("_natural_size")
+            if isinstance(cached_size, tuple) and len(cached_size) == 2:
+                natural_width, natural_height = map(to_int, cached_size)
+            else:
+                source_dir = to_str(info.get("source_dir", ""))
+                path = self._resolve_resource_file(
+                    to_str(info.get("file", "")),
+                    base_dir=Path(source_dir) if source_dir else None,
+                )
+                if path is not None:
+                    natural_width, natural_height = self._read_image_size(path)
+                    info["_natural_size"] = (natural_width, natural_height)
+        if width <= 0:
+            width = max(0, natural_width - x)
+        if height <= 0:
+            height = max(0, natural_height - y)
+        return width, height
 
     def _record_print_img(self, name: str, line: int, col: int = 0) -> None:
         """Record PRINT_IMG metadata for GUI/front-end image rendering.
@@ -4601,7 +4939,15 @@ class EraRuntime:
         )
         self._print_image_lines.append(max(1, int(line)))
 
-    def _record_print_button(self, label: str, value: str, line: int, col: int) -> None:
+    def _record_print_button(
+        self,
+        label: str,
+        value: str,
+        line: int,
+        col: int,
+        *,
+        activate_empty: bool = False,
+    ) -> None:
         """Record PRINTBUTTON metadata for GUI/front-end hit testing.
 
         Plain PRINTBUTTON output is also present in the terminal transcript,
@@ -4613,13 +4959,16 @@ class EraRuntime:
 
         if self._display_suppressed():
             return
-        self.print_buttons.append(
-            {
-                "value": to_str(value),
-                "label": to_str(label),
-                "col": max(0, int(col)),
-            }
-        )
+        button = {
+            "value": to_str(value),
+            "label": to_str(label),
+            "col": max(0, int(col)),
+        }
+        if activate_empty:
+            # INPUT_ONEKEY_TAP uses an empty string to represent Enter.  Keep
+            # that distinct from an ordinary valueless/non-clickable button.
+            button["activate_empty"] = True
+        self.print_buttons.append(button)
         self._print_button_lines.append(max(1, int(line)))
         self._print_button_styles.append(self._style_snapshot())
 
@@ -5109,6 +5458,26 @@ class EraRuntime:
             text = raw
         return text or "─"
 
+    def _drawline_text(self, fill: str) -> str:
+        """Expand a DRAWLINE unit to the configured Emuera window width.
+
+        The legacy 72-character approximation was only correct for a much
+        narrower default console.  eraMegaten configures a 1600 px text area,
+        an 18 px MS Gothic font and therefore renders 89 full-width box glyphs
+        (or 178 half-width ASCII glyphs).  Compute that count from the active
+        config so centered separator rows land at the same x coordinates as
+        Emuera instead of leaving a 152 px inset on both sides.
+        """
+
+        unit = to_str(fill) or "─"
+        window_width = max(1, to_int(_config_raw(self, "ウィンドウ幅") or 1600))
+        font_size = max(1, to_int(_config_raw(self, "フォントサイズ") or 18))
+        half_cell = max(1.0, font_size / 2.0)
+        unit_cells = max(1, self._display_width(unit))
+        unit_pixels = max(1.0, unit_cells * half_cell)
+        repeats = max(1, int(math.ceil(window_width / unit_pixels)))
+        return unit * repeats
+
     def _eval_color_name_arg(self, rest: str) -> str:
         raw = rest.strip()
         if not raw:
@@ -5253,7 +5622,11 @@ class EraRuntime:
             if gid in self.graphics:
                 source = self._render_graphic_image_obj(gid, stack)
         elif "file" in info:
-            path = self._resolve_resource_file(to_str(info.get("file", "")))
+            source_dir = to_str(info.get("source_dir", ""))
+            path = self._resolve_resource_file(
+                to_str(info.get("file", "")),
+                base_dir=Path(source_dir) if source_dir else None,
+            )
             if path is not None:
                 source = self._load_pillow_image(path)
         if source is None:
@@ -5423,10 +5796,10 @@ class EraRuntime:
             from PIL import ImageFont
         except Exception as exc:  # pragma: no cover - depends on optional host package
             raise RuntimeError("Pillow is required for page rendering/export") from exc
-        size = max(8, int(line_height) - 4)
+        size = max(8, int(line_height))
         candidates = [
-            Path(r"C:\Windows\Fonts\meiryo.ttc"),
             Path(r"C:\Windows\Fonts\msgothic.ttc"),
+            Path(r"C:\Windows\Fonts\meiryo.ttc"),
             Path(r"C:\Windows\Fonts\arial.ttf"),
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
             Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
@@ -5581,6 +5954,13 @@ class EraRuntime:
             canvas.alpha_composite(sprite, (x, y))
             return True
 
+        painted_text = {
+            (attr_int(item, "x"), attr_int(item, "y"), to_str(item.get("text", "")))
+            for item in drawables
+            if to_str(item.get("type", "")) in {"text", "html_text"}
+            and to_str(item.get("text", ""))
+        }
+
         for item in drawables:
             kind = to_str(item.get("type", ""))
             x, y, w, h = shifted(item)
@@ -5589,13 +5969,19 @@ class EraRuntime:
             color = self._page_render_rgba(item.get("color", self.default_color), self.default_color)
             if kind in {"image", "print_image"}:
                 if not paste_sprite(item):
-                    draw.rectangle((x, y, x + w - 1, y + h - 1), outline=color)
-                    draw_text({**item, "x": x + min_x + 2, "y": y + min_y + 2, "width": max(0, w - 4), "height": h}, to_str(item.get("src", "")))
+                    fallback = self._page_render_rgba(0x606060, 0x606060)
+                    draw.rectangle((x, y, x + w - 1, y + h - 1), outline=fallback)
+                    if w >= 8 and h >= 8:
+                        draw.line((x, y, x + w - 1, y + h - 1), fill=fallback)
+                        draw.line((x + w - 1, y, x, y + h - 1), fill=fallback)
                 continue
             if kind in {"button", "print_button", "nonbutton", "print_rect"}:
-                draw.rectangle((x, y, x + w - 1, y + h - 1), outline=color)
-                if kind in {"button", "print_button", "nonbutton"}:
-                    draw_text(item, to_str(item.get("label", "")))
+                if kind == "print_rect":
+                    draw.rectangle((x, y, x + w - 1, y + h - 1), outline=color)
+                else:
+                    label = to_str(item.get("label", ""))
+                    if (attr_int(item, "x"), attr_int(item, "y"), label) not in painted_text:
+                        draw_text(item, label)
                 continue
             if kind in {"text", "html_text"}:
                 draw_text(item, to_str(item.get("text", "")))
@@ -5631,21 +6017,23 @@ class EraRuntime:
         return 1 if self._sprite_info(name) is not None else 0
 
     def _sprite_width(self, name: str) -> int:
-        info = self._sprite_info(name)
-        return to_int(info.get("width", 0)) if info else 0
+        return self._sprite_dimensions(name)[0]
 
     def _sprite_height(self, name: str) -> int:
-        info = self._sprite_info(name)
-        return to_int(info.get("height", 0)) if info else 0
+        return self._sprite_dimensions(name)[1]
 
     def _load_resource_sprites(self) -> dict[str, dict[str, Any]]:
         if self._resource_sprites is not None:
             return self._resource_sprites
+        cached = getattr(self.program, "_resource_sprites_cache", None)
+        if cached is not None:
+            self._resource_sprites = cached
+            return cached
         sprites: dict[str, dict[str, Any]] = {}
         root = self.program.root / "resources"
         if root.exists():
-            for path in root.rglob("*"):
-                if not path.is_file() or path.suffix.lower() != ".csv":
+            for path in root.rglob("*.csv"):
+                if not path.is_file():
                     continue
                 try:
                     lines = read_text_auto(path).splitlines()
@@ -5678,12 +6066,14 @@ class EraRuntime:
                             "width": max(0, width),
                             "height": max(0, height),
                             "source": str(path),
+                            "source_dir": str(path.parent),
                         },
                     )
         self._resource_sprites = sprites
+        setattr(self.program, "_resource_sprites_cache", sprites)
         return sprites
 
-    def _resolve_resource_file(self, filename: str) -> Path | None:
+    def _resolve_resource_file(self, filename: str, *, base_dir: Path | None = None) -> Path | None:
         raw = filename.strip().strip('"')
         if not raw:
             return None
@@ -5692,6 +6082,8 @@ class EraRuntime:
         if p.is_absolute():
             candidates.append(p)
         else:
+            if base_dir is not None:
+                candidates.append(base_dir / p)
             candidates.append(self.program.root / p)
             candidates.append(self.program.root / "resources" / p)
             if len(p.parts) == 1:
@@ -6880,8 +7272,13 @@ class EraRuntime:
     def _exec_builtin_command(self, key: str, rest: str) -> bool:
         if key == "REPLACE":
             return self._exec_replace_command(rest)
-        if not rest and call_builtin(self, key, []) is None:
-            return False
+        value: Value | None = None
+        used_no_arg_value = False
+        if not rest:
+            value = call_builtin(self, key, [])
+            if value is None:
+                return False
+            used_no_arg_value = True
         raw_first = key in {"GETNUM", "SUMARRAY", "SUMCARRAY", "MAXARRAY", "MINARRAY", "MAXCARRAY", "MINCARRAY", "INRANGEARRAY", "INRANGECARRAY", "MATCH", "FINDELEMENT", "FINDLASTELEMENT", "VARSIZE", "ERDNAME", "FINDCHARA", "FINDLASTCHARA", "CMATCH", "ISDEFINED", "EXISTVAR", "EXISTFUNCTION", "GETVAR", "GETVARS", "SETVAR", "VARSETEX", "STRJOIN"} or key.startswith(("ENUMFUNC", "ENUMVAR", "ENUMMACRO"))
         ref_positions = self.ref_arg_positions_for_call(key)
         parts = split_era_args(rest)
@@ -6898,7 +7295,8 @@ class EraRuntime:
                 args.append(self.render_form(part).strip(" \t"))
             else:
                 args.append(eval_expr(self, part, default="" if part.strip().startswith('"') or part.strip().startswith('@"') else 0))
-        value = call_builtin(self, key, args)
+        if not used_no_arg_value:
+            value = call_builtin(self, key, args)
         if value is None:
             if key in {"CHKDATA", "GETFONT", "GETBGCOLOR", "SPRITECREATED"}:
                 value = 0
@@ -7111,8 +7509,8 @@ class EraRuntime:
         fr = self.memory.frame
         return bool(fr and key in fr.strings)
 
-    def _try_assignment(self, text: str) -> bool:
-        found = find_assignment(text)
+    def _try_assignment(self, text: str, found: tuple[str, str, str] | None = None) -> bool:
+        found = found if found is not None else find_assignment(text)
         if not found:
             return False
         lhs, op, rhs = found
@@ -7127,15 +7525,15 @@ class EraRuntime:
         except Exception:
             return False
         is_string_target = self._is_string_assignment_target(ref.base)
-        expression_rhs = self._string_assignment_rhs_has_expression_syntax(rhs)
-        text_label_rhs = (
-            self._string_assignment_rhs_is_text_label(rhs)
-            or self._string_assignment_rhs_is_parenthetical_text_label(rhs)
-            or self._string_assignment_rhs_is_parenthesized_form_text(rhs)
-        )
-        literal_string_rhs = (
-            is_string_target
-            and (
+        literal_string_rhs = False
+        if is_string_target:
+            expression_rhs = self._string_assignment_rhs_has_expression_syntax(rhs)
+            text_label_rhs = (
+                self._string_assignment_rhs_is_text_label(rhs)
+                or self._string_assignment_rhs_is_parenthetical_text_label(rhs)
+                or self._string_assignment_rhs_is_parenthesized_form_text(rhs)
+            )
+            literal_string_rhs = (
                 text_label_rhs
                 or (
                     not expression_rhs
@@ -7143,9 +7541,13 @@ class EraRuntime:
                     and not self._string_assignment_rhs_must_eval(rhs)
                 )
             )
-        )
-        rhs_parts = split_era_args(rhs)
-        if op == "=" and ref.indices and len(rhs_parts) > 1 and not literal_string_rhs:
+        if op == "=" and ref.indices and not literal_string_rhs:
+            rhs_parts = split_era_args(rhs)
+            if len(rhs_parts) <= 1:
+                rhs_parts = []
+        else:
+            rhs_parts = []
+        if rhs_parts:
             resolved = self.memory.resolve_indices(norm_name(ref.base), ref.indices)
             prefix = resolved[:-1]
             start = resolved[-1] if resolved else 0
@@ -7154,13 +7556,13 @@ class EraRuntime:
                 value = eval_expr(self, expr_part, default="" if is_string_target else 0) if part else ("" if is_string_target else 0)
                 self.memory.set_var(ref.base, [*prefix, start + offset], value)
             return True
-        old = self.memory.get_var(ref.base, ref.indices)
         if literal_string_rhs:
             value: Value = self.render_form(rhs)
         else:
             expr_rhs = self._prepare_string_expression_rhs(rhs) if is_string_target else rhs
             value = eval_expr(self, expr_rhs, default="" if is_string_target else 0) if rhs else ("" if is_string_target else 0)
         if op != "=":
+            old = self.memory.get_var(ref.base, ref.indices)
             if op == "+=": value = to_str(old) + to_str(value) if isinstance(old, str) or isinstance(value, str) else to_int(old) + to_int(value)
             elif op == "-=": value = to_int(old) - to_int(value)
             elif op == "*=": value = to_int(old) * to_int(value)
@@ -7646,22 +8048,42 @@ class EraRuntime:
 
     # ---- flow scanning ----------------------------------------------------
     def _find_if_branch(self, frame: ExecFrame, pc: int) -> int:
+        branches, end_after = self._if_branches(frame, pc)
+        for branch_pc, key, rest in branches:
+            if key == "ELSE":
+                return branch_pc + 1
+            if truth(eval_expr(self, rest)):
+                return branch_pc + 1
+        return end_after
+
+    def _if_branches(self, frame: ExecFrame, pc: int) -> tuple[tuple[tuple[int, str, str], ...], int]:
+        cache_key = (id(frame.fn), pc)
+        cached = self._if_branch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        branches: list[tuple[int, str, str]] = []
         i = pc + 1; depth = 0
         while i < len(frame.fn.lines):
             k, r = self._keyword(frame.fn.lines[i].text.strip())
             if k == "IF": depth += 1
             elif k == "ENDIF":
-                if depth == 0: return i + 1
+                if depth == 0:
+                    cached = (tuple(branches), i + 1)
+                    self._if_branch_cache[cache_key] = cached
+                    return cached
                 depth -= 1
-            elif depth == 0 and k == "ELSE": return i + 1
-            elif depth == 0 and k == "ELSEIF":
-                if truth(eval_expr(self, r)):
-                    return i + 1
+            elif depth == 0 and k in {"ELSE", "ELSEIF"}:
+                branches.append((i, k, r))
             i += 1
-        return len(frame.fn.lines)
+        cached = (tuple(branches), len(frame.fn.lines))
+        self._if_branch_cache[cache_key] = cached
+        return cached
 
     def _find_matching(self, frame: ExecFrame, pc: int, targets: set[str]) -> int:
-        start_key, _ = self._keyword(frame.fn.lines[pc].text.strip())
+        cache_key = (id(frame.fn), pc, tuple(sorted(targets)))
+        cached = self._matching_cache.get(cache_key)
+        if cached is not None:
+            return cached
         pairs = {"IF": "ENDIF", "SELECTCASE": "ENDSELECT", "FOR": "NEXT", "WHILE": "WEND", "DO": "LOOP", "REPEAT": "REND"}
         openers = set(pairs)
         depth = 0
@@ -7671,25 +8093,43 @@ class EraRuntime:
             if k in openers and pairs.get(k) in targets:
                 depth += 1
             elif k in targets:
-                if depth == 0: return i
+                if depth == 0:
+                    self._matching_cache[cache_key] = i
+                    return i
                 depth -= 1
             i += 1
-        return len(frame.fn.lines) - 1
+        fallback = len(frame.fn.lines) - 1
+        self._matching_cache[cache_key] = fallback
+        return fallback
 
     def _find_case(self, frame: ExecFrame, pc: int, value: Value) -> int:
-        end = self._find_matching(frame, pc, {"ENDSELECT"})
+        branches, end = self._case_branches(frame, pc)
         caseelse = end
+        for case_pc, key, rest in branches:
+            if key == "CASEELSE":
+                caseelse = case_pc
+            elif key == "CASE" and self._case_matches(rest, value):
+                return case_pc + 1
+        return caseelse + (1 if caseelse != end else 0)
+
+    def _case_branches(self, frame: ExecFrame, pc: int) -> tuple[tuple[tuple[int, str, str], ...], int]:
+        cache_key = (id(frame.fn), pc)
+        cached = self._case_branch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        end = self._find_matching(frame, pc, {"ENDSELECT"})
+        branches: list[tuple[int, str, str]] = []
         i = pc + 1; depth = 0
         while i < end:
             k, r = self._keyword(frame.fn.lines[i].text.strip())
             if k == "SELECTCASE": depth += 1
             elif k == "ENDSELECT": depth -= 1
-            elif depth == 0 and k == "CASEELSE":
-                caseelse = i
-            elif depth == 0 and k == "CASE" and self._case_matches(r, value):
-                return i + 1
+            elif depth == 0 and k in {"CASE", "CASEELSE"}:
+                branches.append((i, k, r))
             i += 1
-        return caseelse + (1 if caseelse != end else 0)
+        cached = (tuple(branches), end)
+        self._case_branch_cache[cache_key] = cached
+        return cached
 
     def _case_matches(self, rest: str, value: Value) -> bool:
         for part in split_era_args(rest):
@@ -7706,35 +8146,48 @@ class EraRuntime:
         return False
 
     def _find_catch_for_try(self, frame: ExecFrame, try_pc: int) -> int | None:
+        cache_key = (id(frame.fn), try_pc)
+        if cache_key in self._try_catch_cache:
+            return self._try_catch_cache[cache_key]
         depth = 0
         i = try_pc + 1
         while i < len(frame.fn.lines):
             k, _ = self._keyword(frame.fn.lines[i].text.strip())
-            if k in {"TRYCALL", "TRYCCALL", "TRYCALLFORM", "TRYCCALLFORM"}:
+            if k in self.TRY_CATCH_KEYS:
                 depth += 1
             elif k == "CATCH":
                 if depth == 0:
+                    self._try_catch_cache[cache_key] = i
                     return i
             elif k == "ENDCATCH":
                 if depth == 0:
+                    self._try_catch_cache[cache_key] = None
                     return None
                 depth -= 1
             i += 1
+        self._try_catch_cache[cache_key] = None
         return None
 
     def _find_matching_catch_end(self, frame: ExecFrame, catch_pc: int) -> int:
+        cache_key = (id(frame.fn), catch_pc)
+        cached = self._catch_end_cache.get(cache_key)
+        if cached is not None:
+            return cached
         depth = 0
         i = catch_pc + 1
         while i < len(frame.fn.lines):
             k, _ = self._keyword(frame.fn.lines[i].text.strip())
-            if k in {"TRYCALL", "TRYCCALL", "TRYCALLFORM", "TRYCCALLFORM"}:
+            if k == "CATCH":
                 depth += 1
             elif k == "ENDCATCH":
                 if depth == 0:
+                    self._catch_end_cache[cache_key] = i
                     return i
                 depth -= 1
             i += 1
-        return len(frame.fn.lines) - 1
+        fallback = len(frame.fn.lines) - 1
+        self._catch_end_cache[cache_key] = fallback
+        return fallback
 
     def _exec_for(self, frame: ExecFrame, rest: str) -> None:
         parts = split_era_args(rest)
@@ -7801,6 +8254,15 @@ ASSIGN_OPS = ["+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "'=", "="]
 
 
 def split_call_syntax(rest: str) -> tuple[str, list[str]] | None:
+    parsed = _split_call_syntax_cached(rest)
+    if parsed is None:
+        return None
+    target, args = parsed
+    return target, list(args)
+
+
+@lru_cache(maxsize=65536)
+def _split_call_syntax_cached(rest: str) -> tuple[str, tuple[str, ...]] | None:
     s = rest.strip()
     if not s:
         return None
@@ -7815,11 +8277,11 @@ def split_call_syntax(rest: str) -> tuple[str, list[str]] | None:
             tail = s[close + 1 :].strip()
             if tail.startswith(","):
                 args.extend(split_era_args(tail[1:]))
-            return target, args
+            return target, tuple(args)
     parts = split_era_args(s)
     if not parts:
         return None
-    return parts[0], parts[1:]
+    return parts[0], tuple(parts[1:])
 
 
 def _find_top_level_char(text: str, char: str) -> int:
@@ -7891,6 +8353,7 @@ def _find_matching_paren(text: str, open_index: int) -> int:
     return -1
 
 
+@lru_cache(maxsize=65536)
 def find_assignment(text: str) -> tuple[str, str, str] | None:
     depth = 0; in_str = False; i = 0
     while i < len(text):

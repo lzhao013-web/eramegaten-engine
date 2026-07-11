@@ -228,11 +228,14 @@ def _load_erb_file(program: Program, path: Path, *, debug_blocks: bool) -> None:
     for number, raw_line in enumerate(text.splitlines(), 1):
         raw_lstrip = raw_line.lstrip()
         if raw_lstrip.startswith(";!;"):
-            line = raw_lstrip[3:].rstrip()
+            source_line = raw_lstrip[3:]
+            line = source_line.strip()
         else:
             if raw_lstrip.startswith(";"):
                 continue
-            line = strip_comment(raw_line).strip()
+            uncommented = strip_comment(raw_line)
+            source_line = uncommented.lstrip()
+            line = uncommented.strip()
         if not line:
             continue
         uline = line.upper()
@@ -257,6 +260,7 @@ def _load_erb_file(program: Program, path: Path, *, debug_blocks: bool) -> None:
         if block_parts is not None:
             if line == "}":
                 line = " ".join(part.strip() for part in block_parts if part.strip())
+                source_line = line
                 number = block_start
                 block_parts = None
                 if not line:
@@ -350,4 +354,12 @@ def _load_erb_file(program: Program, path: Path, *, debug_blocks: bool) -> None:
         if line.startswith("$"):
             label = line[1:].strip().split()[0]
             current.labels[norm_name(label)] = idx
-        current.lines.append(SourceLine(text=line, file_index=file_index, number=number))
+        source_key = norm_name(line.split(None, 1)[0]) if line.split(None, 1) else ""
+        preserve_print_spacing = source_key.startswith("PRINT") or source_key == "HTML_PRINT"
+        current.lines.append(
+            SourceLine(
+                text=source_line if preserve_print_spacing else line,
+                file_index=file_index,
+                number=number,
+            )
+        )

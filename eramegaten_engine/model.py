@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -85,6 +86,9 @@ class Program:
     define_names: dict[str, str] = field(default_factory=dict)
     csv: Any = None
     warnings: list[str] = field(default_factory=list)
+    _resource_sprites_cache: Any = None
+    _csv_index_cache: dict[tuple[str, str], int] = field(default_factory=dict)
+    _csv_name_presence_cache: dict[tuple[str, str], bool] = field(default_factory=dict)
 
     def add_file(self, path: Path) -> int:
         text = str(path)
@@ -126,6 +130,11 @@ class Program:
 def split_era_args(text: str, delimiter: str = ",") -> list[str]:
     """Split an Era expression argument list without splitting nested forms."""
 
+    return list(_split_era_args_cached(text, delimiter))
+
+
+@lru_cache(maxsize=65536)
+def _split_era_args_cached(text: str, delimiter: str = ",") -> tuple[str, ...]:
     args: list[str] = []
     start = 0
     depth = 0
@@ -198,7 +207,7 @@ def split_era_args(text: str, delimiter: str = ",") -> list[str]:
     tail = text[start:].strip()
     if tail or text.strip():
         args.append(tail)
-    return args
+    return tuple(args)
 
 
 def strip_comment(line: str) -> str:
@@ -231,9 +240,9 @@ def strip_comment(line: str) -> str:
             i += 1
             continue
         if ch == ';':
-            return line[:i].rstrip()
+            return line[:i]
         i += 1
-    return line.rstrip()
+    return line
 
 
 def read_text_auto(path: Path) -> str:

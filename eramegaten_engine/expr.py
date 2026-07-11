@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Protocol
 
 from .model import EraInputBlocked, norm_name, split_era_args
@@ -138,6 +139,15 @@ def tokenize(text: str) -> list[Token]:
     return out
 
 
+@lru_cache(maxsize=65536)
+def cached_tokens(text: str) -> tuple[Token, ...]:
+    # Expression parsing is deliberately context-dependent, but tokenization is
+    # pure for a given source string.  Real eraMegaten menus repeatedly evaluate
+    # the same small expressions in long loops; caching only tokens keeps
+    # variable reads, function calls, and side effects evaluated live.
+    return tuple(tokenize(_strip_form_markers_outside_strings(text.strip())))
+
+
 def _read_string(text: str, quote_index: int) -> tuple[str, int]:
     assert text[quote_index] == '"'
     form_string = quote_index > 0 and text[quote_index - 1] == "@"
@@ -269,7 +279,7 @@ class ExpressionParser:
         # Era form ternary sometimes appears as \@ cond ? A # B \@; the form
         # renderer strips it, but plain expressions also benefit from removing
         # balanced markers.
-        self.tokens = tokenize(_strip_form_markers_outside_strings(self.text))
+        self.tokens = cached_tokens(self.text)
         self.pos = 0
 
     def peek(self) -> Token:

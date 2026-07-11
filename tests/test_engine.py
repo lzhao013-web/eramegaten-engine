@@ -8,9 +8,11 @@ from pathlib import Path
 from eramegaten_engine.cli import main as cli_main
 from eramegaten_engine.loader import load_program
 from eramegaten_engine.runtime import EraRuntime
+from eramegaten_engine.runtime import find_assignment
 from eramegaten_engine.runtime import split_call_syntax
 from eramegaten_engine.expr import eval_expr
 from eramegaten_engine.memory import CharacterState
+from eramegaten_engine.model import split_era_args
 from eramegaten_engine.native_save import NativeSave, SaveDataType, SaveFileType, native_save_from_memory, read_legacy_text_global_save, read_legacy_text_save, read_native_save, write_native_save
 
 
@@ -84,6 +86,89 @@ class EngineSmokeTests(unittest.TestCase):
         self.assertEqual(eval_expr(rt, '"x" * 3'), "xxx")
         self.assertEqual(eval_expr(rt, "1 ? 20 # 30"), 20)
         self.assertEqual(eval_expr(rt, "00309145"), 309145)
+
+    def test_repeated_control_flow_matching_uses_stable_cached_boundaries(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+LOCAL = 0
+WHILE LOCAL < 3
+SELECTCASE LOCAL
+CASE 0
+IF 0
+PRINTL bad0
+ELSE
+PRINTL zero
+ENDIF
+CASE 1
+PRINTL one
+CASEELSE
+PRINTL other
+ENDSELECT
+LOCAL += 1
+WEND
+IF 0
+PRINTL bad1
+ELSE
+PRINTL done
+ENDIF
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=200)
+        self.assertEqual("".join(rt.output), "zero\none\nother\ndone\n")
+        self.assertGreater(len(rt._matching_cache), 0)
+        self.assertEqual(rt.warnings, [])
+
+    def test_cached_if_branch_structure_re_evaluates_dynamic_elseif(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+CALL CHECK, 1
+CALL CHECK, 2
+CALL CHECK, 3
+RETURN
+
+@CHECK(ARG)
+IF 0
+PRINTL bad
+ELSEIF ARG == 1
+PRINTL one
+ELSEIF ARG == 2
+PRINTL two
+ELSE
+PRINTL other
+ENDIF
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=200)
+        self.assertEqual("".join(rt.output), "one\ntwo\nother\n")
+        self.assertGreater(len(rt._if_branch_cache), 0)
+        self.assertEqual(rt.warnings, [])
+
+    def test_cached_selectcase_structure_re_evaluates_dynamic_case(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+CALL PICK, 2
+CALL PICK, 1
+CALL PICK, 3
+RETURN
+
+@PICK(ARG)
+SELECTCASE 2
+CASE ARG
+PRINTFORML match{ARG}
+CASE 99
+PRINTL bad
+CASEELSE
+PRINTFORML else{ARG}
+ENDSELECT
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=200)
+        self.assertEqual("".join(rt.output), "match2\nelse1\nelse3\n")
+        self.assertGreater(len(rt._case_branch_cache), 0)
+        self.assertEqual(rt.warnings, [])
 
     def test_nested_quotes_inside_form_string_expression(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -327,6 +412,30 @@ RETURN
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
         self.assertEqual("".join(rt.output), "silent\nA=1\n")
+
+    def test_cached_assignment_scan_keeps_rhs_live(self):
+        find_assignment.cache_clear()
+        self.assertEqual(find_assignment("A = B + 1"), ("A", "=", "B + 1"))
+        self.assertEqual(find_assignment("A = B + 1"), ("A", "=", "B + 1"))
+        self.assertGreaterEqual(find_assignment.cache_info().hits, 1)
+
+        td, program = self.make_game('''@SYSTEM_TITLE
+B = 1
+CALL SET_A
+B = 5
+CALL SET_A
+PRINTFORML {A}
+RETURN
+
+@SET_A
+A = B + 1
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "6\n")
+        self.assertEqual(rt.warnings, [])
 
     def test_debugprint_is_recognized_and_kept_out_of_game_output(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -795,19 +904,22 @@ RETURN
         self.assertEqual(page["html"][0]["display_line"], 1)
         self.assertEqual(page["html"][0]["display_end_line"], 2)
         layout = rt.html_layout_model(char_width=8, line_height=20)
-        self.assertEqual(layout["rows"][1]["y"], 20)
-        self.assertEqual(layout["rows"][2]["y"], 40)
+        self.assertFalse(any("<button" in item.get("text", "") for item in layout["texts"]))
+        # Inline images enlarge Emuera's visual line box; later rows must not
+        # overlap a 45px sprite slice.
+        self.assertEqual(layout["rows"][1]["y"], 45)
+        self.assertEqual(layout["rows"][2]["y"], 65)
         self.assertEqual(
             [(img["src"], img["x"], img["y"], img["width"], img["height"]) for img in layout["images"]],
-            [("A1_0_1", 0, 0, 180, 45), ("B2", 200, 40, 16, 12), ("A1_1_1", 201, 30, 50, 25)],
+            [("A1_0_1", 0, 0, 180, 45), ("B2", 200, 65, 16, 12), ("A1_1_1", 201, 55, 50, 25)],
         )
         self.assertEqual(layout["buttons"][0]["x"], 200)
         self.assertGreaterEqual(layout["canvas"]["height"], 45)
-        self.assertEqual(rt.html_click_value(200, 45, char_width=8, line_height=20), "ok")
-        self.assertEqual(rt.html_hit_test(220, 35, char_width=8, line_height=20)["parent"], "nonbutton")
-        self.assertIsNone(rt.html_click_value(220, 35, char_width=8, line_height=20))
-        self.assertEqual(rt.html_hit_test(210, 45, char_width=8, line_height=20)["parent"], "nonbutton")
-        self.assertEqual(rt.html_click_value(210, 45, char_width=8, line_height=20), "ok")
+        self.assertEqual(rt.html_click_value(200, 70, char_width=8, line_height=20), "ok")
+        self.assertEqual(rt.html_hit_test(220, 60, char_width=8, line_height=20)["parent"], "nonbutton")
+        self.assertIsNone(rt.html_click_value(220, 60, char_width=8, line_height=20))
+        self.assertEqual(rt.html_hit_test(210, 70, char_width=8, line_height=20)["parent"], "nonbutton")
+        self.assertEqual(rt.html_click_value(210, 70, char_width=8, line_height=20), "ok")
 
     def test_html_layout_can_scale_explicit_emuera_html_units(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -1218,6 +1330,23 @@ RETURN
         self.assertEqual(rt.warnings, [])
         self.assertEqual("".join(rt.output), "{::/::::ｒﾄr}\nxyok{literal}\n2\n")
 
+    def test_plain_print_preserves_ascii_art_spacing_after_one_command_delimiter(self):
+        td, program = self.make_game(
+            "@SYSTEM_TITLE\n"
+            "PRINTL eraMegaten\n"
+            "PRINTL            ( o.o )\n"
+            "PRINTL tail   \n"
+            "RETURN\n"
+        )
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+
+        self.assertEqual("".join(rt.output), "eraMegaten\n           ( o.o )\ntail   \n")
+        spans = [span["text"] for span in rt.text_spans]
+        self.assertIn("           ( o.o )", spans)
+        self.assertIn("tail   ", spans)
+
     def test_form_string_unescapes_literal_percent_parentheses_and_newline(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 #DIMS S
@@ -1326,6 +1455,27 @@ RETURN
         self.assertEqual("".join(rt.output), "T=愛撫/休憩:21\nI=Potion:5:5\n")
         self.assertEqual(rt.warnings, [])
 
+    def test_csv_metadata_lookup_cache_keeps_dynamic_array_segments_live(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+LOCAL = 1
+FLAG:技能数 = 7
+FLAG:LOCAL = 9
+PRINTFORML A={GETNUM(FLAG, "技能数")}:{GETNUM(FLAG, "技能数")}
+PRINTFORML B={FLAG:LOCAL}
+LOCAL = 0
+PRINTFORML C={FLAG:LOCAL}
+RETURN
+''')
+        root = Path(td.name)
+        (root / "CSV" / "Flag.csv").write_text("0,技能数\n1,LOCAL\n", encoding="utf-8")
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "A=0:0\nB=9\nC=7\n")
+        self.assertEqual(program._csv_index_cache.get(("FLAG", "技能数")), 0)
+        self.assertEqual(rt.warnings, [])
+
     def test_bracket_rename_alias_can_be_array_lvalue_base(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 DE:0:2 = 77
@@ -1430,6 +1580,8 @@ RETURN
             "C=火炎:1\n"
             "L=Light/Chaos/Ｍ/全体/ライフル\n",
         )
+        self.assertTrue(program._csv_name_presence_cache.get(("BASE", "LV")))
+        self.assertEqual(program._csv_index_cache.get(("BASE", "力")), 1)
         self.assertEqual(rt.warnings, [])
 
     def test_era_megaten_simple_native_helpers(self):
@@ -2264,6 +2416,55 @@ RETURN
         )
         self.assertEqual(rt.warnings, [])
 
+    def test_real_script_builtin_command_forms_write_result_registers(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+#DIM CHECKARRAY, 4
+CHECKARRAY:0 = 7
+CHECKARRAY:1 = 9
+CHECKARRAY:2 = 11
+CHECKARRAY:3 = 13
+EXISTCSV 10, 1
+E = RESULT
+CSVNAME 10, 1
+S '= RESULTS
+CSVCALLNAME 10, 1
+S += "/" + RESULTS
+CSVBASE 10, 30, 1
+B = RESULT
+GETNUM BASE, "LV"
+N = RESULT
+FLAG:0 = 0
+SETBIT FLAG:0, 2
+GETBIT FLAG:0, 2
+G = RESULT
+FINDELEMENT CHECKARRAY, 11, 0, 4
+F = RESULT
+STRFIND "abc/def", "/"
+P = RESULT
+STRLENS "A中"
+L = RESULT
+GETMILLISECOND
+M = RESULT >= 0
+PRINTFORML {E}:{B}:{N}:{G}:{F}:{P}:{L}:{M}:%S%
+RETURN
+''')
+        root = Path(td.name)
+        (root / "CSV" / "Base.csv").write_text("30,LV\n", encoding="utf-8")
+        (root / "CSV" / "Chara10_normal.csv").write_text(
+            "番号,10\n名前,Normal\n呼び名,N\n基礎,LV,5\n",
+            encoding="utf-8",
+        )
+        (root / "CSV" / "Chara110_sp.csv").write_text(
+            "番号,10\n名前,Special\n呼び名,SPC\n基礎,LV,9\nフラグ,0,1\n",
+            encoding="utf-8",
+        )
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=200)
+        self.assertEqual("".join(rt.output), "1:9:30:1:2:3:3:1:Special/SPC\n")
+        self.assertEqual(rt.warnings, [])
+
     def test_findchara_id_b_and_m_follow_erb_helpers(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 ADDCHARA 1
@@ -2430,6 +2631,42 @@ RETURN
         self.assertEqual(rt.warnings, [])
         self.assertEqual("".join(rt.output), "small/small/yes\n")
 
+    def test_repeated_expressions_read_live_values_with_token_cache(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+A = 1
+PRINTFORML value={A+1}
+A = 5
+PRINTFORML value={A+1}
+B = 0
+PRINTFORML post={B++}
+PRINTFORML post={B++}
+PRINTFORML now={B}
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual(rt.warnings, [])
+        self.assertEqual("".join(rt.output), "value=2\nvalue=6\npost=0\npost=1\nnow=2\n")
+
+    def test_cached_frame_declarations_still_evaluate_per_call(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+CALL DECL_CASE, 2
+CALL DECL_CASE, 5
+RETURN
+
+@DECL_CASE(ARG)
+#DIM VALUE = ARG + 1
+#DIM ARR, ARG + 2
+PRINTFORML decl={VALUE}:{VARSIZE("ARR")}
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual(rt.warnings, [])
+        self.assertEqual("".join(rt.output), "decl=3:4\ndecl=6:7\n")
+
     def test_string_assignment_renders_html_tag_form_literal(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 #DIMS L_TEXT
@@ -2516,6 +2753,69 @@ RETURN
         out = "".join(rt.output)
         self.assertIn("jumped=3", out)
         self.assertNotIn("bad", out)
+
+    def test_tryjumpform_missing_target_enters_catch_fallback(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+TARGET = 7
+TRYCJUMPFORM MISSING_{TARGET}
+CATCH
+TRYJUMPFORM FALLBACK_{TARGET}, 4
+ENDCATCH
+PRINTL bad
+RETURN
+
+@FALLBACK_7(ARG)
+PRINTFORML fallback={ARG}
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "fallback=4\n")
+        self.assertEqual(rt.warnings, [])
+
+    def test_trygoto_missing_label_enters_catch_without_running_body(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+TRYGOTO MISSING_LABEL
+PRINTL bad-body
+CATCH
+PRINTL caught
+ENDCATCH
+PRINTL after
+RETURN
+
+$FOUND_LABEL
+PRINTL bad-label
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "caught\nafter\n")
+        self.assertEqual(rt.warnings, [])
+
+    def test_successful_trycall_skips_catch_body_with_standalone_tryjump(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+TRYCCALL EXISTS
+PRINTL body
+CATCH
+TRYJUMPFORM FALLBACK
+ENDCATCH
+PRINTL after
+RETURN
+
+@EXISTS
+RETURN 1
+
+@FALLBACK
+PRINTL bad-fallback
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "body\nafter\n")
+        self.assertEqual(rt.warnings, [])
 
     def test_trycalllist_tryjumplist_trygotolist_choose_first_existing_target(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -3210,6 +3510,13 @@ RETURNF 1
         rt.run("SYSTEM_TITLE", max_steps=100)
         self.assertIn("result=12", "".join(rt.output))
 
+    def test_split_era_args_cache_returns_fresh_lists(self):
+        first = split_era_args('A, @"B,{C:D}", FUNC(1,2)')
+        self.assertEqual(first, ["A", '@"B,{C:D}"', "FUNC(1,2)"])
+        first.append("mutated")
+        second = split_era_args('A, @"B,{C:D}", FUNC(1,2)')
+        self.assertEqual(second, ["A", '@"B,{C:D}"', "FUNC(1,2)"])
+
     def test_varset_range(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 #DIM A, 5
@@ -3694,12 +4001,14 @@ GETKEY 65
 PRINTFORML keycmd={RESULT}:{RESULTS}
 GETKEYTRIGGERED 67
 PRINTFORML trigcmd={RESULT}:{GETKEYTRIGGERED(67)}
+GETKEYTRIGGERED
+PRINTFORML trigdefault={RESULT}:{GETKEYTRIGGERED(0)}
 RETURN
 ''')
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.key_state = {65}
-        rt.key_triggered = {65, 67}
+        rt.key_triggered = {0, 65, 67}
         rt.mouse_x = 123
         rt.mouse_y = -45
         rt.mouse_button = "buy/7"
@@ -3709,7 +4018,8 @@ RETURN
             "tick=1:123:-45:buy/7:1:0\n"
             "trig=1:0\n"
             "keycmd=1:1\n"
-            "trigcmd=1:0\n",
+            "trigcmd=1:0\n"
+            "trigdefault=1:0\n",
         )
         self.assertEqual(rt.await_count, 1)
         self.assertEqual(rt.last_await_millis, 12)
@@ -4187,18 +4497,23 @@ RETURN
 
     def test_times_gettime_encode_to_uni_commands(self):
         td, program = self.make_game('''@SYSTEM_TITLE
+#DIMS TS
 A = 8
 TIMES A, 1.25
 GETTIME
 T = RESULT
+TS = RESULTS
+SUBSTRING RESULTS:0, 11, 2
+TOINT RESULTS:0
+H = RESULT
 ENCODETOUNI "Az"
-PRINTFORML {A}:{RESULT}:{RESULT:1}:{RESULT:2}:{T > 0}
+PRINTFORML {A}:{RESULT}:{RESULT:1}:{RESULT:2}:{T > 0}:{STRLEN(TS)}:%SUBSTRING(TS,4,1)%:%SUBSTRING(TS,7,1)%:%SUBSTRING(TS,10,1)%:{H >= 0 && H < 24}
 RETURN
 ''')
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertIn("10:2:65:122:1", "".join(rt.output))
+        self.assertIn("10:2:65:122:1:19:/:/: :1", "".join(rt.output))
 
     def test_swap_incdec_builtin_commands_and_brace_join(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -6748,10 +7063,12 @@ RETURN
         self.assertFalse(rt.waiting_for_input)
         self.assertEqual(rt.warnings, [])
 
-    def test_noninteractive_waitanykey_and_forcewait_preserve_stack_when_explicit_inputs_exhaust(self):
+    def test_noninteractive_wait_commands_preserve_stack_when_explicit_inputs_exhaust(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 INPUT
 PRINTL before
+WAIT
+PRINTL wait
 WAITANYKEY
 PRINTL mid
 FORCEWAIT
@@ -6766,15 +7083,40 @@ RETURN
         self.assertTrue(rt.stack)
         self.assertEqual(rt.queue_input("advance"), "advance")
         rt.continue_run(max_steps=50)
-        self.assertEqual("".join(rt.output), "before\nmid\n")
+        self.assertEqual("".join(rt.output), "before\nwait\n")
+        self.assertTrue(rt.waiting_for_input)
+        self.assertTrue(rt.stack)
+        self.assertEqual(rt.queue_input("next"), "next")
+        rt.continue_run(max_steps=50)
+        self.assertEqual("".join(rt.output), "before\nwait\nmid\n")
         self.assertTrue(rt.waiting_for_input)
         self.assertTrue(rt.stack)
         self.assertEqual(rt.queue_input("finish"), "finish")
         rt.continue_run(max_steps=50)
-        self.assertEqual("".join(rt.output), "before\nmid\nafter\n")
+        self.assertEqual("".join(rt.output), "before\nwait\nmid\nafter\n")
         self.assertFalse(rt.waiting_for_input)
         self.assertEqual(rt.timed_wait_events, [
+            {"command": "WAIT", "millis": 0, "allow_skip": False},
+            {"command": "WAITANYKEY", "millis": 0, "allow_skip": False},
             {"command": "FORCEWAIT", "millis": 0, "allow_skip": False},
+        ])
+        self.assertEqual(rt.warnings, [])
+
+    def test_noninteractive_wait_consumes_advance_input_before_next_prompt(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+INPUT
+PRINTFORML first=%RESULTS%
+WAIT
+INPUT
+PRINTFORML second=%RESULTS%
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False, inputs=["start", "advance", "choice"])
+        rt.run("SYSTEM_TITLE", max_steps=50)
+        self.assertEqual("".join(rt.output), "first=start\nsecond=choice\n")
+        self.assertEqual(rt.timed_wait_events, [
+            {"command": "WAIT", "millis": 0, "allow_skip": False},
         ])
         self.assertEqual(rt.warnings, [])
 
@@ -7026,9 +7368,62 @@ RETURN
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
         lines = "".join(rt.output).splitlines()
-        self.assertEqual(lines[:4], ["=" * 72, "･" * 72, "2" * 72, "─" * 72])
+        # The default Emuera profile is 1600 px wide with an 18 px font:
+        # 178 half-width glyphs or 89 full-width box glyphs fill the row.
+        self.assertEqual(lines[:4], ["=" * 178, "･" * 178, "2" * 178, "─" * 89])
         self.assertRegex(lines[4], r"^1:1:1:\d+$")
         self.assertEqual(rt.warnings, [])
+
+    def test_original_title_layout_matches_1600_pixel_emuera_coordinates(self):
+        td, program = self.make_game(
+            "@SYSTEM_TITLE\n"
+            "ALIGNMENT CENTER\n"
+            "DRAWLINE\n"
+            "PRINTL eraMegaten\n"
+            "PRINTL 真・女神転生\n"
+            "PRINTL\n"
+            "PRINTL ASCII ART  /\\_/\\\n"
+            "PRINTL            ( o.o )\n"
+            "PRINTL             > ^ <\n"
+            "PRINTL\n"
+            "DRAWLINE\n"
+            'PRINTBUTTON "[0]  NEW GAME", 0\n'
+            "PRINTL\n"
+            'PRINTBUTTON "[1]  LOAD GAME", 1\n'
+            "PRINTL\n"
+            "INPUT\n"
+        )
+        self.addCleanup(td.cleanup)
+        (program.root / "emuera.config").write_text(
+            "ウィンドウ幅:1600\nウィンドウ高さ:950\n"
+            "フォント名:ＭＳ ゴシック\nフォントサイズ:18\n一行の高さ:18\n"
+            "内部で使用する東アジア言語:CHINESE_HANS\n",
+            encoding="utf-8",
+        )
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        layout = rt.html_layout_model(char_width=9, line_height=18, viewport_width=1600, html_unit_scale=0.18)
+        text_geometry = [
+            (item["text"], item["x"], item["y"], item["width"])
+            for item in layout["drawables"]
+            if item.get("type") == "text"
+        ]
+
+        self.assertEqual(
+            text_geometry,
+            [
+                ("─" * 89, 0, 0, 1602),
+                ("eraMegaten", 755, 18, 90),
+                ("真・女神転生", 750, 36, 99),
+                ("ASCII ART  /\\_/\\", 728, 72, 144),
+                ("           ( o.o )", 719, 90, 162),
+                ("            > ^ <", 723, 108, 153),
+                ("─" * 89, 0, 144, 1602),
+                ("[0]  NEW GAME", 741, 162, 117),
+                ("[1]  LOAD GAME", 737, 180, 126),
+            ],
+        )
+        self.assertEqual(layout["canvas"], {"width": 1602, "height": 198})
 
     def test_forcekana_printk_family_converts_only_kana_prints(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -7401,6 +7796,77 @@ RETURN
         )
         self.assertEqual(rt.print_images, [{"src": "preset", "width": "32", "height": "16", "col": 0}])
 
+    def test_zero_sized_resource_sprite_uses_remaining_source_dimensions(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+PRINTFORML size={SPRITEWIDTH("whole")}x{SPRITEHEIGHT("whole")}
+PRINT_IMG "whole"
+PRINTL
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        from PIL import Image
+
+        root = Path(td.name)
+        (root / "resources").mkdir()
+        (root / "resources" / "画像.csv").write_text(
+            "whole,img.png,2,3,0,0\n",
+            encoding="utf-8",
+        )
+        Image.new("RGBA", (10, 8), (20, 40, 60, 255)).save(root / "resources" / "img.png")
+
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        layout = rt.html_layout_model(char_width=8, line_height=20)
+
+        self.assertIn("size=8x5\n", "".join(rt.output))
+        self.assertEqual(rt.print_images, [{"src": "whole", "width": "8", "height": "5", "col": 0}])
+        self.assertEqual(
+            [(item["width"], item["height"]) for item in layout["print_images"]],
+            [(8, 5)],
+        )
+        self.assertEqual(rt.render_sprite_image("whole").size, (8, 5))
+
+    def test_missing_print_image_has_visible_layout_fallback(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+PRINT_IMG "missing_sprite"
+PRINTL
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+
+        image = rt.html_layout_model(char_width=8, line_height=20)["print_images"][0]
+
+        self.assertGreater(image["width"], 8)
+        self.assertEqual(image["height"], 20)
+        self.assertTrue(image["asset_missing"])
+
+    def test_resource_sprite_registry_is_cached_per_loaded_program(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+GCREATE 7, 80, 40
+SPRITECREATE "dyn", 7, 1, 2, 30, 12
+PRINTFORML preset={SPRITECREATED("preset")}:{SPRITEWIDTH("preset")}x{SPRITEHEIGHT("preset")}
+PRINTFORML dyn={SPRITECREATED("dyn")}:{SPRITEWIDTH("dyn")}x{SPRITEHEIGHT("dyn")}
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        (root / "resources").mkdir()
+        (root / "resources" / "画像.csv").write_text("preset,img.png,0,0,32,16\n", encoding="utf-8")
+
+        rt1 = EraRuntime(program, echo=False, interactive=False)
+        rt1.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt1.output), "preset=1:32x16\ndyn=1:30x12\n")
+        cache = getattr(program, "_resource_sprites_cache", None)
+        self.assertIsNotNone(cache)
+        self.assertIs(rt1._load_resource_sprites(), cache)
+
+        rt2 = EraRuntime(program, echo=False, interactive=False)
+        self.assertEqual(rt2._sprite_created("preset"), 1)
+        self.assertIs(rt2._load_resource_sprites(), cache)
+        self.assertEqual(rt2._sprite_created("dyn"), 0)
+
     def test_graphic_registry_can_render_and_cli_export_png(self):
         td, program = self.make_game('''#DIM MAT, 1, 5, 5
 @SYSTEM_TITLE
@@ -7429,12 +7895,16 @@ RETURN
         root = Path(td.name)
         (root / "resources").mkdir()
         (root / "resources" / "画像.csv").write_text("preset,img.png,2,0,2,2\n", encoding="utf-8")
+        (root / "resources" / "Sub").mkdir()
+        (root / "resources" / "Sub" / "nested.csv").write_text("nested,img.png,0,0,3,3\n", encoding="utf-8")
         source = Image.new("RGBA", (4, 2), (0, 0, 0, 0))
         for x in range(2):
             for y in range(2):
                 source.putpixel((x, y), (255, 0, 0, 255))
                 source.putpixel((x + 2, y), (0, 255, 0, 255))
         source.save(root / "resources" / "img.png")
+        nested_source = Image.new("RGBA", (3, 3), (0, 0, 255, 255))
+        nested_source.save(root / "resources" / "Sub" / "img.png")
 
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
@@ -7449,6 +7919,9 @@ RETURN
         sprite = rt.render_sprite_image("preset")
         self.assertEqual(sprite.size, (2, 2))
         self.assertEqual(sprite.getpixel((0, 0)), (0, 255, 0, 255))
+        nested = rt.render_sprite_image("nested")
+        self.assertEqual(nested.size, (3, 3))
+        self.assertEqual(nested.getpixel((2, 2)), (0, 0, 255, 255))
 
         export_path = root / "exports" / "canvas.png"
         rt.export_graphic_png(2, export_path)
@@ -7574,6 +8047,39 @@ RETURN
         self.assertEqual(rendered.getpixel((16, 0)), (0, 255, 0, 255))
         self.assertNotEqual(rendered.getpixel((0, 0)), (0, 255, 0, 255))
 
+    def test_print_img_slices_expand_rows_and_hide_transcript_markers(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+PRINT_IMG "slice1"
+PRINTL
+PRINT_IMG "slice2"
+PRINTS "X"
+PRINTL
+PRINTL after
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        from PIL import Image
+
+        root = Path(td.name)
+        (root / "resources").mkdir()
+        (root / "resources" / "画像.csv").write_text(
+            "slice1,img.png,0,0,30,25\nslice2,img.png,0,25,30,25\n",
+            encoding="utf-8",
+        )
+        Image.new("RGBA", (30, 50), (40, 180, 80, 255)).save(root / "resources" / "img.png")
+
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        layout = rt.html_layout_model(char_width=8, line_height=20)
+
+        self.assertEqual([row["y"] for row in layout["rows"]], [0, 25, 50])
+        self.assertEqual(
+            [(image["src"], image["x"], image["y"], image["height"]) for image in layout["print_images"]],
+            [("slice1", 0, 0, 25), ("slice2", 0, 25, 25)],
+        )
+        self.assertEqual([(item["text"], item["x"], item["y"]) for item in layout["texts"]], [("X", 30, 25), ("after", 0, 50)])
+        self.assertNotIn("[IMG:", "".join(item.get("text", "") for item in layout["drawables"]))
+
     def test_write_img_and_get_img_type_native_helpers(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 ADDCHARA 10
@@ -7610,6 +8116,7 @@ RETURN
         self.assertEqual([(rect["display_line"], rect["col"], rect["width"]) for rect in page["print_rects"]], [(4, 0, 400)])
         layout = rt.html_layout_model(char_width=8, line_height=20)
         self.assertEqual([(rect["x"], rect["y"], rect["width"], rect["height"]) for rect in layout["print_rects"]], [(0, 60, 400, 20)])
+        self.assertNotIn("[IMG:", "".join(item.get("text", "") for item in layout["drawables"]))
 
     def test_write_img_special_face_hook(self):
         td, program = self.make_game('''@SYSTEM_TITLE
