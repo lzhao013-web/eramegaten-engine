@@ -11,6 +11,14 @@ python -m pip install -e .
 python -m pytest
 ```
 
+启动检阅前端：
+
+```powershell
+python -m eramegaten_engine.gui
+```
+
+前端支持可筛选操作面板、右键批量跳过消息、数字直输、中键拖动、缩放/适宽和输入历史。
+
 ## 状态
 
 项目仍在实验阶段，适合兼容性验证、脚本分析和自动化回放。
