@@ -176,13 +176,27 @@ class Memory:
             self.frames.pop()
 
     def _init_defaults(self) -> None:
-        self.numeric.setdefault("RESULT", {})[()] = 0
-        self.strings.setdefault("RESULTS", {})[()] = ""
-        self.numeric.setdefault("MASTER", {})[()] = 0
-        self.numeric.setdefault("PLAYER", {})[()] = 0
-        self.numeric.setdefault("TARGET", {})[()] = 0
-        self.numeric.setdefault("ASSI", {})[()] = 1
-        self.numeric.setdefault("CHARANUM", {})[()] = 0
+        def numeric_default(name: str, value: int) -> None:
+            table = self.numeric.setdefault(name, {})
+            if () not in table and (0,) not in table:
+                table_set_alias(table, (), value)
+
+        def string_default(name: str, value: str) -> None:
+            table = self.strings.setdefault(name, {})
+            if () not in table and (0,) not in table:
+                table_set_alias(table, (), value)
+
+        # Native Emuera saves encode these scalar-like built-ins as one-element
+        # arrays.  Reinitialising the empty-index alias after a load used to
+        # shadow the restored ``(0,)`` value (TARGET became 0 and ASSI became
+        # 1), which in turn selected the wrong portraits and character stats.
+        numeric_default("RESULT", 0)
+        string_default("RESULTS", "")
+        numeric_default("MASTER", 0)
+        numeric_default("PLAYER", 0)
+        numeric_default("TARGET", 0)
+        numeric_default("ASSI", 1)
+        numeric_default("CHARANUM", 0)
         for i, value in enumerate([0, 100, 500, 3000, 10000, 30000, 60000, 100000, 150000, 250000, 1000000, 5000000, 30000000, 100000000, 250000000, 450000000, 650000000, 900000000]):
             self.numeric.setdefault("PALAMLV", {}).setdefault((i,), value)
         for i, value in enumerate([0, 1, 4, 20, 50, 200, 500, 1000, 1500, 2000, 3000]):
@@ -202,13 +216,12 @@ class Memory:
                     self.numeric.setdefault(dest, {})[()] = parse_era_int(gb.get(src, "0"))
                 except ValueError:
                     self.numeric.setdefault(dest, {})[()] = 0
-            for key, names in self.csv.index_to_name.items():
-                if key in STRING_ARRAYS:
-                    table = self.strings.setdefault(key, {})
-                    for idx, value in names.items():
-                        table.setdefault((idx,), value)
-                    if 0 in names:
-                        table.setdefault((), names[0])
+            # CSV names are symbolic indices, not initial contents of mutable
+            # string arrays.  Seeding STR/SAVESTR/TSTR with those labels makes
+            # an untouched SAVESTR:299 contain ``コロシアム・ランダムマッチ``;
+            # VERUP_TEMP then reports a corrupt save that the original Emuera
+            # correctly considers empty.  ITEMNAME/TRAINNAME and the other
+            # *NAME views are resolved lazily in get_var instead.
         self._init_decl_initializers()
 
     def _init_decl_initializers(self) -> None:

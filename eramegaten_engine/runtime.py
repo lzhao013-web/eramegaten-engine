@@ -247,6 +247,8 @@ class EraRuntime:
         return OMITTED_ARG if fn and index in fn.defaults else ""
 
     def call_expr_function(self, name: str, args: list[Value]) -> Value:
+        if norm_name(name) == "DPOINT":
+            args = self._resolve_dpoint_context_args(args)
         built = call_builtin(self, name, args)
         if built is not None:
             return built
@@ -283,6 +285,15 @@ class EraRuntime:
     def run(self, entry: str = "SYSTEM_TITLE", *, max_steps: int = 100000) -> int:
         self.fatal_error = None
         self.waiting_for_input = False
+        if norm_name(entry) == "SYSTEM_TITLE" and not self.output:
+            db = getattr(self.program, "csv", None)
+            replacements = getattr(db, "replacements", {}) if db is not None else {}
+            startup = to_str(replacements.get(norm_name("起動時簡略表示"), ""))
+            if startup:
+                # Emuera writes the configured no-report startup message to
+                # the same console before entering SYSTEM_TITLE.  It remains
+                # visible after the direct LOADDATA used by the parity fixtures.
+                self._write(startup, newline=True, harvest_buttons=False)
         if not self._push_call_sequence(entry, []):
             raise KeyError(f"entry function not found: {entry}")
         return self._run_loop(max_steps=max_steps, stop_depth=0)
@@ -358,11 +369,11 @@ class EraRuntime:
         fn = EraFunction(
             name="__ENGINE_SHOP_LOOP",
             lines=[
-                SourceLine("$LOOP", -1, 0),
+                SourceLine("TRYCALL EVENTSHOP", -1, 0),
                 SourceLine("CALL SHOW_SHOP", -1, 0),
                 SourceLine("__SHOPINPUT", -1, 0),
                 SourceLine("CALL USERSHOP", -1, 0),
-                SourceLine("CALL EVENTSHOP", -1, 0),
+                SourceLine("__CLEARSCREEN", -1, 0),
                 SourceLine("GOTO LOOP", -1, 0),
             ],
             labels={"LOOP": 0},
@@ -383,14 +394,14 @@ class EraRuntime:
             name="__ENGINE_TRAIN_LOOP",
             lines=[
                 SourceLine("TRYCALL EVENTTRAIN", -1, 0),
-                SourceLine("$LOOP", -1, 0),
                 SourceLine("TRYCALL SHOW_STATUS", -1, 0),
                 SourceLine("TRYCALL SHOW_USERCOM", -1, 0),
                 SourceLine("__TRAININPUT", -1, 0),
                 SourceLine("TRYCALL USERCOM", -1, 0),
+                SourceLine("__CLEARSCREEN", -1, 0),
                 SourceLine("GOTO LOOP", -1, 0),
             ],
-            labels={"LOOP": 1},
+            labels={"LOOP": 0},
             source_file=-1,
             source_line=0,
         )
@@ -450,7 +461,14 @@ class EraRuntime:
         return out
 
     def _return(self, value: Value | None = None) -> None:
-        self._return_values([] if value is None else [value])
+        # Falling off the end of a numeric ERB procedure yields zero.
+        # Predicate helpers commonly only ``RETURN 1`` in the true branch and
+        # fall through otherwise; retaining the caller's stale RESULT turns
+        # every later predicate true (SHOW_SHOP consequently reported four
+        # nonexistent newly-opened dungeons).
+        if value is None:
+            value = "" if self.stack and self.stack[-1].fn.returns_string else 0
+        self._return_values([value])
 
     def _return_values(self, values: list[Value]) -> None:
         for i, value in enumerate(values):
@@ -955,7 +973,8 @@ class EraRuntime:
         eraMegaten actually relies on to coordinates:
 
         * display rows flow vertically at ``line_height`` and expand to the
-          tallest inline image/PRINT_IMG slice on that row
+          tallest inline HTML image on that row; classic ``PRINT_IMG`` slices
+          are fitted to one text row, matching Emuera's console renderer
         * ``pos`` / parent ``pos`` -> x coordinate
         * ``ypos`` -> image y offset from the row baseline
         * explicit ``width/height`` fall back to natural sprite size
@@ -1012,28 +1031,31 @@ class EraRuntime:
         def print_image_sized(element: dict[str, Any]) -> tuple[int, int, bool]:
             """Resolve PRINT_IMG geometry once for flow and painting.
 
-            PRINT_IMG sprites are commonly horizontal slices of a portrait.
-            Their real height contributes to Emuera's visual line box; using
-            the configured 18px text row for every slice makes consecutive
-            pieces overlap and produces the corrupted gray blocks previously
-            visible in dungeon/formation screens.
+            Emuera fits every classic PRINT_IMG sprite into the current text
+            line height while preserving its aspect ratio.  eraMegaten relies
+            on this for portraits split into six 180x30 strips: with an 18px
+            line height each strip is rendered as 108x18, producing one
+            108x108 portrait without changing the surrounding row spacing.
+
+            The recorded width/height are source-sprite dimensions, not CSS-
+            style requested dimensions.  HTML images continue to use ``sized``
+            above and may enlarge their line box independently.
             """
 
             source = to_str(element.get("src", ""))
-            width = int_attr(element.get("width"))
-            height = int_attr(element.get("height"))
+            natural_width = int_attr(element.get("width"))
+            natural_height = int_attr(element.get("height"))
             asset_missing = False
-            if width <= 0 or height <= 0:
-                natural_width, natural_height = self._sprite_dimensions(source)
-                width = width or natural_width
-                height = height or natural_height
-            if width <= 0:
+            if natural_width <= 0 or natural_height <= 0:
+                resolved_width, resolved_height = self._sprite_dimensions(source)
+                natural_width = natural_width or resolved_width
+                natural_height = natural_height or resolved_height
+            if natural_width <= 0 or natural_height <= 0:
                 width = max(char_width, self._layout_text_width(f"[IMG:{source}]") * char_width)
                 asset_missing = True
-            if height <= 0:
-                height = line_height
-                asset_missing = True
-            return max(0, width), max(0, height), asset_missing
+            else:
+                width = int(round(natural_width * line_height / natural_height))
+            return max(0, width), line_height, asset_missing
 
         rows: list[dict[str, Any]] = []
         drawables: list[dict[str, Any]] = []
@@ -1057,11 +1079,6 @@ class EraRuntime:
                 _image_width, image_height = sized(image)
                 image_y = html_unit_attr(image.get("ypos"), 0)
                 row_height = max(row_height, max(0, image_y) + image_height)
-            for image in row.get("print_images", []):
-                if not isinstance(image, dict):
-                    continue
-                _image_width, image_height, _missing = print_image_sized(image)
-                row_height = max(row_height, image_height)
             base_y = next_row_y
             next_row_y += row_height
             row_model = {
@@ -1274,6 +1291,7 @@ class EraRuntime:
                         "value": button.get("value", ""),
                         "title": button.get("title", ""),
                         "label": label,
+                        "runs": list(button.get("runs", [])),
                         "color": int_attr(button.get("color"), self.current_color),
                         "bgcolor": int_attr(button.get("bgcolor"), self.current_bgcolor),
                         "font": button.get("font", self.current_font),
@@ -1300,6 +1318,7 @@ class EraRuntime:
                         "height": line_height,
                         "title": nonbutton.get("title", ""),
                         "label": label,
+                        "runs": list(nonbutton.get("runs", [])),
                         "color": int_attr(nonbutton.get("color"), self.current_color),
                         "bgcolor": int_attr(nonbutton.get("bgcolor"), self.current_bgcolor),
                         "font": nonbutton.get("font", self.current_font),
@@ -1817,6 +1836,18 @@ class EraRuntime:
         self._implicit_button_lines.clear()
         self._implicit_button_styles.clear()
 
+    def _clear_display_page(self) -> None:
+        """Discard the current Emuera page before a built-in state redraw."""
+
+        self.output.clear()
+        self.text_spans.clear()
+        self._html_visual_line_extra = 0
+        self._html_raw_line_breaks.clear()
+        self._html_raw_lines.clear()
+        self._trim_html_to_line_count(0)
+        self._clear_visible_buttons()
+        self.printc_counter = 0
+
     def _input(self, default: str = "") -> str:
         if self.inputs:
             value = self.inputs.pop(0)
@@ -2283,6 +2314,10 @@ class EraRuntime:
             self._exec_input(flow_key, flow_rest)
             frame.pc += 1
             return
+        if key == "__CLEARSCREEN":
+            self._clear_display_page()
+            frame.pc += 1
+            return
         if key == "__TRAININPUT":
             flow_key, flow_rest = self._flow_input_command()
             if self._input_would_block(flow_key, flow_rest):
@@ -2735,15 +2770,26 @@ class EraRuntime:
             else:
                 out.append(eval_expr(self, part))
         if norm_name(target) == "DPOINT":
-            # eraMegaten's automap code first primes DPOINT with the current
-            # dungeon name and then uses compact DPOINT("=", ...) /
-            # DPOINT(,,x,y) shorthand.  Emuera resolves this against the
-            # current dungeon context; mirror that so the write-back branch does
-            # not fall into DPOINT's CASEELSE diagnostic path.
-            while len(out) < 6:
-                out.append("")
-            if to_str(out[5]) == "":
-                out[5] = f"ダンジョン{to_int(self.memory.get_var('FLAG', ['現ダンジョン'])):02d}"
+            out = self._resolve_dpoint_context_args(out)
+        return out
+
+    def _resolve_dpoint_context_args(self, args: list[Any]) -> list[Any]:
+        """Materialize eraMegaten's persistent DPOINT map context.
+
+        DPOINT first receives the active dungeon/floor and later appears as an
+        expression using ``DPOINT(,,x,y)``.  Emuera keeps its private #DIM
+        variables between those invocations.  Until general static private
+        variables are modeled, use the equivalent live FLAG values for both
+        statement calls and expression-function calls.
+        """
+
+        out = list(args)
+        while len(out) < 6:
+            out.append("")
+        if out[4] is OMITTED_ARG or to_str(out[4]) == "":
+            out[4] = to_int(self.memory.get_var("FLAG", ["現M"]))
+        if out[5] is OMITTED_ARG or to_str(out[5]) == "":
+            out[5] = f"ダンジョン{to_int(self.memory.get_var('FLAG', ['現ダンジョン'])):02d}"
         return out
 
     def _ref_param_positions(self, fn: EraFunction) -> set[int]:
@@ -4380,7 +4426,19 @@ class EraRuntime:
                 self._paused_print_wait = None
                 return
             plain_print = key.startswith("PRINTPLAIN")
-            newline = key.endswith(("L", "W", "LC", "WC")) or "FORML" in key or "FORMW" in key or key in {"PRINTL", "PRINTW", "PRINTDATA", "HTML_PRINT"}
+            printc = self._is_printc_key(key)
+            # In Emuera's C-family, C means a fixed-width right-aligned column
+            # and LC means a fixed-width left-aligned column.  The L in LC is
+            # alignment, not PRINTL's newline suffix.  Treating PRINTFORMLC as
+            # a line print expanded eraMegaten's three-column shop into one
+            # button per row.
+            newline = (not printc) and (
+                key.endswith(("L", "W"))
+                or "FORML" in key
+                or "FORMW" in key
+                or key in {"PRINTL", "PRINTW", "PRINTDATA", "HTML_PRINT"}
+            )
+            left_align_cell = printc and "LC" in key
             if key == "PRINT_RECT":
                 frame_width = to_int(eval_expr(self, rest, default=0)) if rest else 0
                 placeholder = "▭" * max(1, min(72, frame_width // 100 if frame_width else 1))
@@ -4410,9 +4468,9 @@ class EraRuntime:
                 if len(args) >= 2 and not self.interactive and not self._display_suppressed():
                     self.pending_buttons.append(value)
                 if key in {"PRINTBUTTONC", "PRINTBUTTONLC"}:
-                    display_text = self._printc_cell_text(text)
+                    display_text = self._printc_cell_text(text, left_align=left_align_cell)
                     self._record_print_button(display_text, value, self._next_visual_write_start_line(), self._current_line_col())
-                    self._write_printc_cell(text, newline=newline)
+                    self._write_printc_cell(text, newline=newline, left_align=left_align_cell)
                 else:
                     self._record_print_button(text, value, self._next_visual_write_start_line(), self._current_line_col())
                     self._write(text, newline=False)
@@ -4434,7 +4492,12 @@ class EraRuntime:
             if kana_print:
                 text = self._apply_force_kana(text)
             if self._is_printc_key(key):
-                self._write_printc_cell(text, newline=newline, harvest_buttons=not plain_print)
+                self._write_printc_cell(
+                    text,
+                    newline=newline,
+                    harvest_buttons=not plain_print,
+                    left_align=left_align_cell,
+                )
                 return
             html_start_line = self._next_write_start_line() if key == "HTML_PRINT" else 0
             html_visual_start_line = self._next_visual_write_start_line() if key == "HTML_PRINT" else 0
@@ -4574,6 +4637,48 @@ class EraRuntime:
             pos = match.end()
         return self._html_style_payload(style)
 
+    def _html_label_runs(self, label_html: str, base_style: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return visible control text split at nested HTML style changes."""
+
+        runs: list[dict[str, Any]] = []
+        style = dict(base_style)
+        stack: list[tuple[str, dict[str, Any]]] = []
+        pos = 0
+
+        def append(raw: str) -> None:
+            text = html_lib.unescape(raw)
+            if not text:
+                return
+            payload = self._html_style_payload(style)
+            if runs and all(runs[-1].get(key) == payload.get(key) for key in payload):
+                runs[-1]["text"] = to_str(runs[-1].get("text", "")) + text
+            else:
+                runs.append({"text": text, **payload})
+
+        for match in self._HTML_TAG_RE.finditer(label_html):
+            if match.start() > pos:
+                append(label_html[pos:match.start()])
+            tag = norm_name(match.group("name"))
+            if tag == "BR":
+                append("\n")
+                pos = match.end()
+                continue
+            if match.group("close"):
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i][0] == tag:
+                        del stack[i:]
+                        break
+                style = stack[-1][1] if stack else dict(base_style)
+            else:
+                attrs = self._html_attrs(match.group("attrs"))
+                style = self._html_apply_open_tag_style(style, tag, attrs)
+                if tag not in {"IMG", "HR", "INPUT", "META", "LINK"} and not match.group("attrs").strip().endswith("/"):
+                    stack.append((tag, style))
+            pos = match.end()
+        if pos < len(label_html):
+            append(label_html[pos:])
+        return runs
+
     def _record_html_text_run(self, text: str, display_line: int, col: int, style: dict[str, Any]) -> int:
         plain = html_lib.unescape(text)
         if not plain:
@@ -4627,7 +4732,10 @@ class EraRuntime:
         close_lengths: dict[int, int] = {}
         for regex in (self._HTML_BUTTON_RE, self._HTML_NONBUTTON_RE):
             for match in regex.finditer(html_text):
-                length = self._html_fragment_visible_cols(match.group("label").strip())
+                # Emuera HTML preserves padding inside controls.  Formation
+                # builds fixed-width party columns by appending spaces inside
+                # each <button>; stripping them collapses all three columns.
+                length = self._html_fragment_visible_cols(match.group("label"))
                 open_lengths[match.start()] = length
                 close_start = html_text.rfind("</", match.start(), match.end())
                 if close_start >= 0:
@@ -4789,13 +4897,17 @@ class EraRuntime:
             img_parents.append((match.start(), match.end(), "button", attrs))
             value = attrs.get("VALUE", "")
             label = re.sub(r"<[^>]*>", "", match.group("label"))
-            self.html_buttons.append({
+            base_style = self._html_style_at_offset(text, match.start())
+            button = {
                 "value": value,
                 "title": attrs.get("TITLE", ""),
                 "pos": attrs.get("POS", ""),
-                "label": html_lib.unescape(label).strip(),
-            })
-            base_style = self._html_style_at_offset(text, match.start())
+                "label": html_lib.unescape(label),
+            }
+            label_runs = self._html_label_runs(match.group("label"), base_style)
+            if len(label_runs) > 1:
+                button["runs"] = label_runs
+            self.html_buttons.append(button)
             line, col = control_positions.get(match.start(), (visual_line_for_offset(match.start()), 0))
             control_image_contexts.append((match.start(), match.end(), match.start("label"), line, col, attrs))
             style = self._html_label_style(match.group("label"), base_style)
@@ -4806,12 +4918,16 @@ class EraRuntime:
             attrs = self._html_attrs(match.group("attrs"))
             img_parents.append((match.start(), match.end(), "nonbutton", attrs))
             label = re.sub(r"<[^>]*>", "", match.group("label"))
-            self.html_nonbuttons.append({
+            base_style = self._html_style_at_offset(text, match.start())
+            nonbutton = {
                 "title": attrs.get("TITLE", ""),
                 "pos": attrs.get("POS", ""),
-                "label": html_lib.unescape(label).strip(),
-            })
-            base_style = self._html_style_at_offset(text, match.start())
+                "label": html_lib.unescape(label),
+            }
+            label_runs = self._html_label_runs(match.group("label"), base_style)
+            if len(label_runs) > 1:
+                nonbutton["runs"] = label_runs
+            self.html_nonbuttons.append(nonbutton)
             line, col = control_positions.get(match.start(), (visual_line_for_offset(match.start()), 0))
             control_image_contexts.append((match.start(), match.end(), match.start("label"), line, col, attrs))
             style = self._html_label_style(match.group("label"), base_style)
@@ -5148,25 +5264,50 @@ class EraRuntime:
         raw = _config_raw(self, "デバッグコマンドを使用する").strip()
         return norm_name(raw) in {"YES", "TRUE", "ON", "1"}
 
-    def _write_printc_cell(self, text: str, *, newline: bool, harvest_buttons: bool = True) -> None:
-        text = self._printc_cell_text(text)
+    def _write_printc_cell(
+        self,
+        text: str,
+        *,
+        newline: bool,
+        harvest_buttons: bool = True,
+        left_align: bool = False,
+    ) -> None:
+        text = self._printc_cell_text(text, left_align=left_align)
         self._write(text, newline=False, harvest_buttons=harvest_buttons)
         self.printc_counter += 1
-        if newline or (self._printc_per_line() > 0 and self.printc_counter >= self._printc_per_line()):
+        # Emuera pads C/LC cells but does not insert a row break merely because
+        # the configured column count was reached.  eraMegaten reads
+        # PRINTCPERLINE() and emits PRINTL itself (CHECK_NEWLINE, SHOPPRINTCPL,
+        # dungeon grids, etc.).  Auto-wrapping here doubled every menu row.
+        if newline:
             self._write("", newline=True)
             self.printc_counter = 0
 
     def _display_width(self, text: str) -> int:
-        lang = (_config_raw(self, "内部で使用する東アジア言語") or "").upper()
-        if any(marker in lang for marker in ("CHINESE_HANS", "SIMPLIFIED", "ZH_CN", "ZH-HANS")):
-            encoding = "gbk"
-        elif any(marker in lang for marker in ("CHINESE_HANT", "TRADITIONAL", "ZH_TW", "ZH-HANT")):
-            encoding = "cp950"
-        elif any(marker in lang for marker in ("KOREAN", "KO_KR", "KO-KR")):
-            encoding = "cp949"
-        else:
-            encoding = "cp932"
-        return len(to_str(text).encode(encoding, errors="replace"))
+        """Return Emuera/MS Gothic half-cell width for console text.
+
+        A locale codec byte count is tempting, but it makes Unicode block
+        elements two cells under GBK.  The original renderer's MS Gothic face
+        gives ``▅``/``▄`` one 9px cell while CJK and box-drawing ``─`` use two
+        cells.  Unicode wide/full-width classes cover ordinary CJK; for the
+        ambiguous class, CP932 encodability mirrors the glyph widths exposed by
+        the configured legacy font (block elements and hearts fall back to one
+        byte, box drawing remains double-byte).
+        """
+
+        width = 0
+        for ch in to_str(text):
+            if unicodedata.combining(ch):
+                continue
+            east = unicodedata.east_asian_width(ch)
+            if east in {"W", "F"}:
+                width += 2
+            elif east == "A":
+                encoded = ch.encode("cp932", errors="replace")
+                width += 2 if len(encoded) > 1 and encoded != b"?" else 1
+            else:
+                width += 1
+        return width
 
     def _layout_text_width(self, text: str) -> int:
         """Return the front-end character-cell width for visible text.
@@ -5197,13 +5338,22 @@ class EraRuntime:
             used += ch_width
         return "".join(out)
 
-    def _printc_cell_text(self, text: str) -> str:
+    def _printc_cell_text(self, text: str, *, left_align: bool = False) -> str:
         width = self._printc_width()
         text = to_str(text)
         if width <= 0:
             return text
-        text = self._truncate_display_width(text, width)
-        return text + (" " * max(0, width - self._display_width(text)))
+        # C/LC sets a *minimum* field width; it does not clip an overlong
+        # label.  Emuera lets that field expand and shifts following columns.
+        # The training filter row deliberately exercises this with a 27-cell
+        # label in a 25-cell configuration.
+        padding = " " * max(0, width - self._display_width(text))
+        # Emuera's LC family reserves one trailing separator cell (the shop's
+        # left-aligned columns therefore advance 26 cells), while the C family
+        # advances exactly the configured width (the training menu advances 25
+        # cells).  This asymmetry is visible in the original renderer and is
+        # relied on by both of eraMegaten's main menu layouts.
+        return text + padding + " " if left_align else padding + text
 
     def _exec_reuse_last_line(self, rest: str) -> None:
         """Replace the latest rendered terminal line with a message.
@@ -7450,14 +7600,14 @@ class EraRuntime:
         if "%" in s or "{" in s or "\\@" in s:
             # Mixed form strings may start with words that are also numeric
             # built-ins (e.g. ``TARGET:[{CPOS(...)}] %CALLNAME...,LEFT%`` in
-            # battle messages).  Do not force expression evaluation just
-            # because that leading label matches a symbol; only a standalone
-            # lvalue-like RHS such as ``CSTR:ARG:0`` must be evaluated.
-            try:
-                parse_lvalue(self, s)
-                return True
-            except Exception:
-                return False
+            # battle messages).  They are form text, not lvalues.  In
+            # particular the expression tokenizer can legally consume an
+            # entire string such as ``{COUNT}箇所...`` as one identifier;
+            # treating that permissive parse as proof of an lvalue collapses
+            # the rendered notification to numeric zero.  Standalone lvalues
+            # such as ``CSTR:ARG:0`` contain no form markers and are handled by
+            # the normal symbol checks below.
+            return False
         first = s.split(":", 1)[0].strip()
         key = norm_name(first)
         full_key = norm_name(s)

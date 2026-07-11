@@ -295,6 +295,9 @@ RETURN
         td, program = self.make_game('''@SYSTEM_TITLE
 PRINTFORML L={STRLEN("A中あ")}:{STRLENS("A中あ")}:{STRLENSU("A中あ")}
 PRINTFORML LF={STRLENFORM("A{1}中")}:{STRLENFORMU("A{1}中")}
+PRINTFORML S=%SUBSTRING("愛撫系フィルタ",0,6)%:%SUBSTRINGU("愛撫系フィルタ",0,6)%
+PRINTFORML M=%SUBSTRING("助手・レズ系フィルタ",0,11)%
+PRINTFORML I={STRFIND("A中B","B")}:{STRFINDU("A中B","B")}
 STRLENFORM A{1}中
 PRINTFORML F={RESULT}
 STRLENFORMU A{1}中
@@ -305,7 +308,10 @@ RETURN
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "L=5:5:3\nLF=4:3\nF=4\nFU=3\n")
+        self.assertEqual(
+            "".join(rt.output),
+            "L=5:5:3\nLF=4:3\nS=愛撫系:愛撫系フィル\nM=助手・レズ系\nI=3:2\nF=4\nFU=3\n",
+        )
         self.assertEqual(rt.warnings, [])
 
     def test_expression_function_omitted_arguments(self):
@@ -384,21 +390,66 @@ RETURN
         self.assertEqual("".join(rt.output), "first/first:7/7\n")
 
     def test_dpoint_shorthand_uses_current_dungeon_name(self):
-        td, program = self.make_game('''@SYSTEM_TITLE
+        td, _ = self.make_game('''@SYSTEM_TITLE
 FLAG:現ダンジョン = 1
+FLAG:現M = 3
 CALLF DPOINT("=" , 2 , 5 , 7)
-PRINTFORML %GLOBALS:0%
+PRINTFORML S=%GLOBALS:0%:{GLOBAL:0}
+PRINTFORML E={DPOINT(,,5,7)}
+PRINTFORML X=%GLOBALS:0%:{GLOBAL:0}
 RETURN
 
 @DPOINT(ARGS = "GET" , ARG = -1 , ARG:1 = -1 , ARG:2 = -1 , ARG:3 = -1 , ARGS:1 = "")
 #FUNCTION
 GLOBALS:0 = %ARGS:1%
+GLOBAL:0 = ARG:3
 RETURNF 0
 ''')
+        root = Path(td.name)
+        (root / "CSV" / "Flag.csv").write_text("1,現ダンジョン\n2,現M\n", encoding="utf-8")
+        program = load_program(root)
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertIn("ダンジョン01", "".join(rt.output))
+        self.assertEqual("".join(rt.output), "S=ダンジョン01:3\nE=0\nX=ダンジョン01:3\n")
+
+    def test_qident_lvalue_alias_is_dereferenced_without_suffix(self):
+        td, _ = self.make_game('''@SYSTEM_TITLE
+FLAG:2:0 = 0
+PRINTFORML Z={[[REQUEST_ALIAS]]}
+FLAG:2:0 = 7
+PRINTFORML V={[[REQUEST_ALIAS]]}
+RETURN
+''')
+        root = Path(td.name)
+        (root / "CSV" / "_Rename.csv").write_text("FLAG:2:0,REQUEST_ALIAS\n", encoding="utf-8")
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "Z=0\nV=7\n")
+        self.assertEqual(rt.warnings, [])
+
+    def test_startup_replacement_banner_survives_initial_shop_begin(self):
+        td, _ = self.make_game('''@SYSTEM_TITLE
+BEGIN SHOP
+
+@EVENTSHOP
+RETURN
+
+@SHOW_SHOP
+PRINTL menu
+RETURN
+''')
+        root = Path(td.name)
+        (root / "CSV" / "_Replace.csv").write_text("起動時簡略表示,DDS-NET connected...\n", encoding="utf-8")
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "DDS-NET connected...\nmenu\n")
+        self.assertTrue(rt.waiting_for_input)
+        self.assertEqual(rt.warnings, [])
 
     def test_assignment_variable_name_can_start_with_print(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -732,6 +783,28 @@ RETURN
             ("inner", 0xFF0000, 1),
         ])
         self.assertEqual(layout["nonbuttons"][0]["font_style"], 2)
+        self.assertEqual(rt.warnings, [])
+
+    def test_html_control_preserves_padding_and_nested_color_runs(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+HTML_PRINT "<button value='x'>  Base<font color='#ff0000'>Red</font>  </button>"
+INPUTS
+RETURN
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+
+        button = rt.html_buttons[0]
+        self.assertEqual(button["label"], "  BaseRed  ")
+        self.assertEqual([(run["text"], run["color"]) for run in button["runs"]], [
+            ("  Base", rt.default_color),
+            ("Red", 0xFF0000),
+            ("  ", rt.default_color),
+        ])
+        layout_button = rt.html_layout_model(char_width=8, line_height=20)["buttons"][0]
+        self.assertEqual(layout_button["label"], "  BaseRed  ")
+        self.assertEqual([run["color"] for run in layout_button["runs"]], [rt.default_color, 0xFF0000, rt.default_color])
         self.assertEqual(rt.warnings, [])
 
     def test_html_styled_text_runs_are_exposed_outside_controls(self):
@@ -1099,15 +1172,15 @@ RETURN
         page = rt.html_page_model()
         self.assertEqual([(b["display_line"], b["col"], b["label"], b["value"]) for b in page["print_buttons"]], [
             (1, 0, "[A]", "alpha"),
-            (1, 3, "Cell ", "cell"),
-            (1, 8, "Line ", "line"),
+            (1, 3, " Cell", "cell"),
+            (1, 8, "Line  ", "line"),
         ])
         self.assertEqual([b["color"] for b in page["print_buttons"]], [0x123456, 0x123456, 0x123456])
         layout = rt.html_layout_model(char_width=8, line_height=20)
         self.assertEqual([(b["label"], b["x"], b["width"], b["value"]) for b in layout["print_buttons"]], [
             ("[A]", 0, 24, "alpha"),
-            ("Cell ", 24, 40, "cell"),
-            ("Line ", 64, 40, "line"),
+            (" Cell", 24, 40, "cell"),
+            ("Line  ", 64, 48, "line"),
         ])
         self.assertEqual(rt.html_click_value(1, 1, char_width=8, line_height=20), "alpha")
         self.assertEqual(rt.html_click_value(25, 1, char_width=8, line_height=20), "cell")
@@ -4229,6 +4302,49 @@ RETURNF 1
         self.assertIn("da=200:100:200:100:100:200:0", out)
         self.assertIn("ta=2500:20:20:0", out)
 
+    def test_implicit_fallthrough_resets_stale_numeric_result(self):
+        td, program = self.make_game('''@SYSTEM_TITLE
+RESULT = 1
+CALL FALSE_PREDICATE
+PRINTFORML R={RESULT}
+RETURN
+
+@FALSE_PREDICATE
+SIF 0
+    RETURN 1
+''')
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "R=0\n")
+        self.assertEqual(rt.warnings, [])
+
+    def test_duplicate_csv_names_resolve_to_first_occurrence(self):
+        td, _ = self.make_game("@SYSTEM_TITLE\nRETURN\n")
+        root = Path(td.name)
+        (root / "CSV" / "Talent.csv").write_text("140,男性\n185,男性\n", encoding="utf-8")
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        self.assertEqual(program.csv.resolve_index("TALENT", "男性"), 140)
+        self.assertEqual(program.csv.index_to_name["TALENT"][185], "男性")
+
+    def test_csv_string_maps_are_symbolic_and_mutable_arrays_start_empty(self):
+        td, _ = self.make_game('''@SYSTEM_TITLE
+PRINTFORML S=|%SAVESTR:299%|%STR:4%|%ITEMNAME:7%
+RETURN
+''')
+        root = Path(td.name)
+        (root / "CSV" / "SAVESTR.csv").write_text("299,RandomMatch\n", encoding="utf-8")
+        (root / "CSV" / "STR.csv").write_text("4,MutableLabel\n", encoding="utf-8")
+        (root / "CSV" / "Item.csv").write_text("7,Potion\n", encoding="utf-8")
+        program = load_program(root)
+        self.addCleanup(td.cleanup)
+        rt = EraRuntime(program, echo=False, interactive=False)
+        rt.run("SYSTEM_TITLE", max_steps=100)
+        self.assertEqual("".join(rt.output), "S=|||Potion\n")
+        self.assertEqual(program.csv.resolve_index("SAVESTR", "RandomMatch"), 299)
+        self.assertEqual(rt.warnings, [])
+
     def test_variable_size_system_names_shadow_csv_constants(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 PRINTFORML init={R}:{SELECTCOM}:{VARSIZE("R")}:{VARSIZE("SELECTCOM")}:{VARSIZE("DA", 1)}
@@ -5795,7 +5911,7 @@ RETURN
 @EVENTLOAD
 PRINTFORML C={CHARANUM}:{NO:0}:{ISASSI:0}:%NAME:0%/%CALLNAME:0%:{BASE:0:0}:{MAXBASE:0:0}:{ABL:0:1}
 PRINTFORML Y={CFLAG:0:2}:{JUEL:0:1}:{EQUIP:0:1}:{TEQUIP:0:0}
-PRINTFORML G={DAY:1}:{MONEY:2}:{ITEM:3}:{FLAG:4}:{PALAMLV:3}:{EXPLV:4}:{TARGET:0}:%SAVESTR:1%
+PRINTFORML G={DAY:1}:{MONEY:2}:{ITEM:3}:{FLAG:4}:{PALAMLV:3}:{EXPLV:4}:{TARGET}/{TARGET:0}:%SAVESTR:1%
 PRINTFORML X=%CSTR:0:2%:{LEGACY_FLAG:0:1}:{LEGACY_FLAG:1:1}:%LEGACY_STR:3%:{LEGACY_SCALAR}
 PRINTFORML V={LASTLOAD_VERSION}:{LASTLOAD_NO}:%LASTLOAD_TEXT%
 RETURN
@@ -5901,7 +6017,7 @@ RETURN
         out = "".join(rt.output)
         self.assertIn("C=1:42:1:Hero/HeroCall:10:20:30", out)
         self.assertIn("Y=88:4:66:7", out)
-        self.assertIn("G=12:345:7:9:3333:444:8:savetail", out)
+        self.assertIn("G=12:345:7:9:3333:444:8/8:savetail", out)
         self.assertIn("X=bio:5:9:tail:77", out)
         self.assertIn("V=309140:2:legacy caption", out)
         self.assertNotIn("after-load", out)
@@ -6149,7 +6265,10 @@ RETURN
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False, inputs=["7"])
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "menu\nuser=7\nevent=7\nmenu\n")
+        # The consumed command page is cleared before EVENTSHOP redraws the
+        # next visible page, matching Emuera's shop lifecycle.
+        self.assertEqual("".join(rt.output), "event=7\nmenu\n")
+        self.assertTrue(rt.waiting_for_input)
 
     def test_noninteractive_input_uses_first_printbutton(self):
         td, program = self.make_game('''@SYSTEM_TITLE
@@ -7414,7 +7533,7 @@ RETURN
             [
                 ("─" * 89, 0, 0, 1602),
                 ("eraMegaten", 755, 18, 90),
-                ("真・女神転生", 750, 36, 99),
+                ("真・女神転生", 746, 36, 108),
                 ("ASCII ART  /\\_/\\", 728, 72, 144),
                 ("           ( o.o )", 719, 90, 162),
                 ("            > ^ <", 723, 108, 153),
@@ -7475,9 +7594,9 @@ RETURN
         self.addCleanup(td.cleanup)
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertIn("1".ljust(25) + "2".ljust(25) + "3".ljust(25) + "\nend\n", "".join(rt.output))
+        self.assertEqual("".join(rt.output), "1".rjust(25) + "2".rjust(25) + "3".rjust(25) + "end\n")
 
-    def test_printcperline_reads_config_and_zero_disables_autowrap(self):
+    def test_printcperline_reports_config_without_implicit_autowrap(self):
         td = tempfile.TemporaryDirectory()
         root = Path(td.name)
         (root / "ERB").mkdir()
@@ -7495,7 +7614,7 @@ RETURN
         self.addCleanup(td.cleanup)
         rt = EraRuntime(load_program(root), echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "per=2\nA   B   \nC   done\n")
+        self.assertEqual("".join(rt.output), "per=2\n   A   B   Cdone\n")
         self.assertEqual(rt.warnings, [])
 
         td_zero = tempfile.TemporaryDirectory()
@@ -7515,10 +7634,10 @@ RETURN
         self.addCleanup(td_zero.cleanup)
         rt_zero = EraRuntime(load_program(root_zero), echo=False, interactive=False)
         rt_zero.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt_zero.output), "0:A  B  C  end\n")
+        self.assertEqual("".join(rt_zero.output), "0:  A  B  Cend\n")
         self.assertEqual(rt_zero.warnings, [])
 
-    def test_printc_padding_and_truncation_use_east_asian_display_width(self):
+    def test_printc_alignment_and_overflow_use_east_asian_display_width(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 #DIMS S
 S = "漢字A"
@@ -7540,7 +7659,7 @@ RETURN
         )
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "漢A B   |\n漢字C   |\n漢字\nD   |\n")
+        self.assertEqual("".join(rt.output), " 漢A   B|\n漢字A   C|\n漢字A    D|\n")
         self.assertEqual(rt.warnings, [])
 
     def test_page_layout_uses_east_asian_display_width_for_cjk_print_buttons(self):
@@ -7563,19 +7682,19 @@ RETURN
         self.assertEqual([(span["display_line"], span["col"], span["text"]) for span in page["style_spans"]], [
             (1, 0, "漢"),
             (1, 2, "字"),
-            (2, 0, "漢A "),
-            (2, 4, "B   "),
+            (2, 0, " 漢A"),
+            (2, 4, "B    "),
         ])
         self.assertEqual([(b["display_line"], b["col"], b["label"], b["value"]) for b in page["print_buttons"]], [
             (1, 2, "字", "go"),
-            (2, 0, "漢A ", "cell"),
-            (2, 4, "B   ", "next"),
+            (2, 0, " 漢A", "cell"),
+            (2, 4, "B    ", "next"),
         ])
         layout = rt.html_layout_model(char_width=8, line_height=20)
         self.assertEqual([(b["label"], b["x"], b["width"], b["value"]) for b in layout["print_buttons"]], [
             ("字", 16, 16, "go"),
-            ("漢A ", 0, 32, "cell"),
-            ("B   ", 32, 32, "next"),
+            (" 漢A", 0, 32, "cell"),
+            ("B    ", 32, 40, "next"),
         ])
         self.assertEqual(rt.html_click_value(17, 1, char_width=8, line_height=20), "go")
         self.assertEqual(rt.html_click_value(31, 21, char_width=8, line_height=20), "cell")
@@ -7598,7 +7717,7 @@ RETURN
         self.addCleanup(td.cleanup)
         rt = EraRuntime(load_program(root), echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "A    B    \ndone\n")
+        self.assertEqual("".join(rt.output), "    AB     done\n")
         self.assertEqual(rt.pending_buttons, ["10", "two"])
         self.assertEqual(rt.warnings, [])
 
@@ -7624,7 +7743,7 @@ RETURN
         )
         rt = EraRuntime(program, echo=False, interactive=False)
         rt.run("SYSTEM_TITLE", max_steps=100)
-        self.assertEqual("".join(rt.output), "plain-line\nF2-form\nC   D   \nrow\ncolored\n")
+        self.assertEqual("".join(rt.output), "plain-line\nF2-form\n   CD    row\ncolored\n")
         page = rt.html_page_model()
         spans = [(span["display_line"], span["text"], span["color"]) for span in page["style_spans"]]
         self.assertEqual(spans, [
@@ -7632,10 +7751,10 @@ RETURN
             (1, "-line", rt.default_color),
             (2, "F2", rt.default_color),
             (2, "-form", rt.default_color),
-            (3, "C   ", rt.default_color),
-            (3, "D   ", rt.default_color),
-            (4, "row", rt.default_color),
-            (5, "colored", 0x112233),
+            (3, "   C", rt.default_color),
+            (3, "D    ", rt.default_color),
+            (3, "row", rt.default_color),
+            (4, "colored", 0x112233),
         ])
         self.assertEqual(rt.warnings, [])
 
@@ -7822,7 +7941,7 @@ RETURN
         self.assertEqual(rt.print_images, [{"src": "whole", "width": "8", "height": "5", "col": 0}])
         self.assertEqual(
             [(item["width"], item["height"]) for item in layout["print_images"]],
-            [(8, 5)],
+            [(32, 20)],
         )
         self.assertEqual(rt.render_sprite_image("whole").size, (8, 5))
 
@@ -8042,12 +8161,12 @@ RETURN
         page = rt.html_page_model()
         self.assertEqual([(img["display_line"], img["col"], img["src"]) for img in page["print_images"]], [(1, 2, "preset")])
         layout = rt.html_layout_model(char_width=8, line_height=10)
-        self.assertEqual([(img["x"], img["y"], img["width"], img["height"]) for img in layout["print_images"]], [(16, 0, 2, 2)])
+        self.assertEqual([(img["x"], img["y"], img["width"], img["height"]) for img in layout["print_images"]], [(16, 0, 10, 10)])
         rendered = rt.render_page_image(char_width=8, line_height=10)
         self.assertEqual(rendered.getpixel((16, 0)), (0, 255, 0, 255))
         self.assertNotEqual(rendered.getpixel((0, 0)), (0, 255, 0, 255))
 
-    def test_print_img_slices_expand_rows_and_hide_transcript_markers(self):
+    def test_print_img_slices_fit_text_rows_and_hide_transcript_markers(self):
         td, program = self.make_game('''@SYSTEM_TITLE
 PRINT_IMG "slice1"
 PRINTL
@@ -8072,12 +8191,12 @@ RETURN
         rt.run("SYSTEM_TITLE", max_steps=100)
         layout = rt.html_layout_model(char_width=8, line_height=20)
 
-        self.assertEqual([row["y"] for row in layout["rows"]], [0, 25, 50])
+        self.assertEqual([row["y"] for row in layout["rows"]], [0, 20, 40])
         self.assertEqual(
             [(image["src"], image["x"], image["y"], image["height"]) for image in layout["print_images"]],
-            [("slice1", 0, 0, 25), ("slice2", 0, 25, 25)],
+            [("slice1", 0, 0, 20), ("slice2", 0, 20, 20)],
         )
-        self.assertEqual([(item["text"], item["x"], item["y"]) for item in layout["texts"]], [("X", 30, 25), ("after", 0, 50)])
+        self.assertEqual([(item["text"], item["x"], item["y"]) for item in layout["texts"]], [("X", 24, 20), ("after", 0, 40)])
         self.assertNotIn("[IMG:", "".join(item.get("text", "") for item in layout["drawables"]))
 
     def test_write_img_and_get_img_type_native_helpers(self):
@@ -8088,6 +8207,7 @@ CFLAG:0:ショップ顔グラ = 3
 PRINTFORML T={GET_IMG_TYPE(0,0,-100)}:{GET_IMG_TYPE(0,1,0)}
 CALL WRITE_IMG, 0, 301, 2, "キャラ番号指定/ア禮服取得"
 PRINTFORML ADDR=%RESULTS%:{RESULT}
+PRINTS 漢
 CALL WRITE_IMG, 0, 301, 2, "キャラ番号指定"
 PRINTL
 CALL WRITE_IMG, 10, 0, 1
@@ -8098,6 +8218,7 @@ RETURN
 ''')
         self.addCleanup(td.cleanup)
         root = Path(td.name)
+        (root / "emuera.config").write_text("内部で使用する東アジア言語:CHINESE_HANS\n", encoding="utf-8")
         (root / "resources").mkdir()
         (root / "resources" / "画像.csv").write_text("A10_301_2,img.png,0,0,32,16\n", encoding="utf-8")
         rt = EraRuntime(program, echo=False, interactive=False)
@@ -8107,12 +8228,12 @@ RETURN
             "".join(rt.output),
             "T=300:301\n"
             "ADDR=A10_301_2:1\n"
-            "[IMG:A10_301_2]\n"
+            "漢[IMG:A10_301_2]\n"
             "▭▭▭▭\n"
             "MISS=NO_IMG:0\n",
         )
         page = rt.html_page_model()
-        self.assertEqual([(img["display_line"], img["col"], img["src"], img["width"], img["height"]) for img in page["print_images"]], [(3, 0, "A10_301_2", "32", "16")])
+        self.assertEqual([(img["display_line"], img["col"], img["src"], img["width"], img["height"]) for img in page["print_images"]], [(3, 2, "A10_301_2", "32", "16")])
         self.assertEqual([(rect["display_line"], rect["col"], rect["width"]) for rect in page["print_rects"]], [(4, 0, 400)])
         layout = rt.html_layout_model(char_width=8, line_height=20)
         self.assertEqual([(rect["x"], rect["y"], rect["width"], rect["height"]) for rect in layout["print_rects"]], [(0, 60, 400, 20)])
@@ -9989,6 +10110,12 @@ RETURN
         self.assertIn("x\ry\n\n", out)
         self.assertIn("F=Master私♥♡❤TargName\n", out)
         self.assertIn("Master/私/♥/7/[9]strike\n", out)
+        colorbar_spans = [
+            (span["text"], span["color"])
+            for span in rt.html_page_model()["style_spans"]
+            if span["text"] in {"#", "...."}
+        ]
+        self.assertEqual(colorbar_spans, [("#", 0x990000), ("....", 0x000000)])
         self.assertIn("R=0\n♥♡❤\n", out)
 
     def test_era_megaten_heart_mark_native_helpers(self):

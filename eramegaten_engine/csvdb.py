@@ -160,7 +160,12 @@ class EraCsvDatabase:
             name = row[1].strip()
             if not name:
                 continue
-            n2i[norm_name(name)] = idx
+            # Emuera resolves duplicate display names to their first CSV
+            # occurrence.  eraMegaten's Talent.csv intentionally contains two
+            # entries named ``男性`` (biological sex at 140 and appearance at
+            # 185); overwriting the first mapping makes HAVE_PENIS inspect the
+            # latter and removes the ejaculation status row from training.
+            n2i.setdefault(norm_name(name), idx)
             i2n[idx] = name
             # Also install a scoped constant so [[BASE:LV]] and bare LV can be resolved.
             self.constants.setdefault(norm_name(f"{key}:{name}"), idx)
@@ -244,7 +249,7 @@ class EraCsvDatabase:
             if not name:
                 continue
             i2n[idx] = name
-            n2i[norm_name(name)] = idx
+            n2i.setdefault(norm_name(name), idx)
             if dimension == 1:
                 self.constants.setdefault(norm_name(f"{key}:{name}"), idx)
 

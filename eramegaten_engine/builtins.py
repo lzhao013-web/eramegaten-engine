@@ -188,19 +188,53 @@ def b_strlenformu(ctx, args): return _unicode_strlen(ctx.render_form(to_str(arg(
 def b_substring(ctx, args):
     s = to_str(arg(args, 0))
     start = max(0, to_int(arg(args, 1)))
-    length = to_int(arg(args, 2, len(s) - start))
+    encoding = _east_asian_text_encoding(ctx)
+    spans: list[tuple[int, int, str]] = []
+    offset = 0
+    for ch in s:
+        next_offset = offset + len(ch.encode(encoding, errors="replace"))
+        spans.append((offset, next_offset, ch))
+        offset = next_offset
+    length = to_int(arg(args, 2, offset - start))
     # Emuera commonly uses -1 as "to the end" for SUBSTRING's length
-    # argument.  eraMegaten relies on this when splitting saved comma-delimited
-    # strings (e.g. CPD/STRFLAG helpers); Python's negative slice stop would
-    # otherwise return an empty/truncated string.
-    if length < 0:
-        return s[start:]
-    return s[start:start + length]
-def b_substringu(ctx, args): return b_substring(ctx, args)
+    # argument.  The non-U family addresses the active East Asian encoding in
+    # bytes (SUBSTRINGU is the Unicode/code-point variant).  eraMegaten relies
+    # on that distinction when it subtracts a STRLENS byte count from Japanese
+    # CSV names to build the fixed-width training filter menu.
+    end = offset if length < 0 else start + max(0, length)
+    # Keep the original Unicode characters while addressing them by encoded
+    # byte spans.  Encoding and decoding the slice would turn characters not
+    # representable in GBK (notably the Japanese middle dot in
+    # ``助手・レズ系``) into ``?``, unlike Emuera's original string value.
+    return "".join(ch for byte_start, byte_end, ch in spans if byte_start >= start and byte_end <= end)
+
+
+def b_substringu(ctx, args):
+    s = to_str(arg(args, 0))
+    start = max(0, to_int(arg(args, 1)))
+    length = to_int(arg(args, 2, len(s) - start))
+    return s[start:] if length < 0 else s[start:start + length]
+
+
 def b_strfind(ctx, args):
+    encoding = _east_asian_text_encoding(ctx)
+    haystack = to_str(arg(args, 0))
+    needle = to_str(arg(args, 1))
+    start = max(0, to_int(arg(args, 2, 0)))
+    char_start = 0
+    byte_offset = 0
+    while char_start < len(haystack) and byte_offset < start:
+        byte_offset += len(haystack[char_start].encode(encoding, errors="replace"))
+        char_start += 1
+    found = haystack.find(needle, char_start)
+    if found < 0:
+        return -1
+    return len(haystack[:found].encode(encoding, errors="replace"))
+
+
+def b_strfindu(ctx, args):
     start = max(0, to_int(arg(args, 2, 0)))
     return to_str(arg(args, 0)).find(to_str(arg(args, 1)), start)
-def b_strfindu(ctx, args): return b_strfind(ctx, args)
 def _expand_dotnet_replacement(template: str, match: re.Match[str]) -> str:
     out: list[str] = []
     i = 0
@@ -8174,13 +8208,19 @@ def b_print_colorbar(ctx, args):
     fill_char = to_str(arg(args, 3, "*"))
     empty_char = to_str(arg(args, 4, "."))
     old = getattr(ctx, "current_color", 0xC0C0C0)
+    fill_color = to_int(arg(args, 5, old))
+    empty_color = to_int(arg(args, 6, old))
     filled = width if maximum <= 0 and value > 0 else (value * width // maximum if maximum > 0 else 0)
     filled = max(0, min(width, filled))
-    _print_no_newline(ctx, fill_char * filled + empty_char * (width - filled))
     try:
+        if filled:
+            ctx.current_color = fill_color
+            _print_no_newline(ctx, fill_char * filled)
+        if filled < width:
+            ctx.current_color = empty_color
+            _print_no_newline(ctx, empty_char * (width - filled))
+    finally:
         ctx.current_color = old
-    except Exception:
-        pass
     return 0
 
 
@@ -8836,12 +8876,19 @@ def _print_img_placeholder(ctx, name: str) -> None:
         next_line = getattr(ctx, "_next_visual_write_start_line", None)
         if not callable(next_line):
             next_line = getattr(ctx, "_next_write_start_line", None)
+        current_col = getattr(ctx, "_current_line_col", None)
         current_line = getattr(ctx, "_current_line_text", None)
         if callable(record):
             record(
                 name,
                 next_line() if callable(next_line) else 1,
-                len(current_line()) if callable(current_line) else 0,
+                (
+                    current_col()
+                    if callable(current_col)
+                    else len(current_line())
+                    if callable(current_line)
+                    else 0
+                ),
             )
         # Keep the marker in the plain transcript for CLI/debug compatibility,
         # but never register it as styled GUI text.  Native WRITE_IMG reaches

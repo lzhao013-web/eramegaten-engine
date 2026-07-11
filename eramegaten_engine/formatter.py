@@ -216,10 +216,13 @@ class EraFormatter:
             width = to_int(eval_expr(self.context, parts[1], default=0))
             align = parts[2].strip().upper() if len(parts) >= 3 else "RIGHT"
             if width > 0:
+                width_fn = getattr(self.context, "_display_width", len)
+                padding = max(0, width - int(width_fn(s)))
                 if align.startswith("LEFT"):
-                    s = s.ljust(width)
+                    s = s + " " * padding
                 elif align.startswith("CENTER"):
-                    s = s.center(width)
+                    left = padding // 2
+                    s = " " * left + s + " " * (padding - left)
                 else:
-                    s = s.rjust(width)
+                    s = " " * padding + s
         return s

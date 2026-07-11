@@ -373,7 +373,12 @@ class ExpressionParser:
             return self.context.render_form(tok.value)
         if tok.kind == "QIDENT":
             value = self.context.call_expr_function("__CONST__", [tok.value])
-            if isinstance(value, str) and self.peek().kind == "COLON":
+            if isinstance(value, str):
+                # _Rename.csv may map a [[qualified name]] directly to an
+                # lvalue (for example ``依頼フラグ:2:0``).  The alias must be
+                # dereferenced even when the source QIDENT has no extra
+                # ``:index`` suffix; returning the non-empty alias string made
+                # every such condition truthy.
                 ref = ExpressionParser(self.context, value).parse_var_ref()
                 while self.accept(":"):
                     ref.indices.append(self.index_segment())
