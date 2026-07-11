@@ -158,6 +158,19 @@ def command_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_gui(args: argparse.Namespace) -> int:
+    # Import lazily so audit/run/inspect remain usable on hosts without Tk.
+    from .gui import launch_gui
+
+    return launch_gui(
+        args.root or "",
+        entry=args.entry,
+        max_steps=args.max_steps,
+        auto_run=not args.no_auto_run,
+        legacy_tk=args.legacy_tk,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eramegaten", description="Modern Python EraBasic/Emuera-compatible engine for eraMegaten")
     sub = p.add_subparsers(dest="command", required=True)
@@ -202,6 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("function")
             sp.add_argument("--limit", type=int, default=80)
             sp.set_defaults(func=command_inspect)
+    gui = sub.add_parser("gui", help="open the desktop inspection frontend")
+    gui.add_argument("root", nargs="?", default="", help="game root; it can also be selected in the window")
+    gui.add_argument("--entry", default="SYSTEM_TITLE")
+    gui.add_argument("--max-steps", type=int, default=30000)
+    gui.add_argument("--no-auto-run", action="store_true")
+    gui.add_argument("--legacy-tk", action="store_true")
+    gui.set_defaults(func=command_gui)
     return p
 
 

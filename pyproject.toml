@@ -4,9 +4,14 @@ version = "0.1.0"
 description = "A modern Python 3.11 EraBasic/Emuera-compatible runtime for eraMegaten."
 requires-python = ">=3.11"
 authors = [{name = "Codex"}]
+dependencies = [
+  "Pillow>=9.0",
+  "PySide6-Essentials>=6.8,<6.9",
+]
 
 [project.scripts]
 eramegaten = "eramegaten_engine.cli:main"
+eramegaten-gui = "eramegaten_engine.gui:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
