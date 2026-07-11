@@ -514,11 +514,11 @@ class QtFrontendTests(unittest.TestCase):
             follow_output=True,
         )
 
-        # 198 px of output plus Emuera's fresh 18 px cursor row leaves a
-        # 734 px blank history area above the title, exactly like the original.
-        self.assertEqual(view.content_origin_y, 734)
+        # 198 px of output plus Emuera's fresh 18 px cursor row and final
+        # client-edge cursor pixel leave 733 px above the title.
+        self.assertEqual(view.content_origin_y, 733)
         self.assertEqual(view.canvas_size, (1600, 950))
-        self.assertEqual(round(view.hit_regions[0]["rect"].top()), 914)
+        self.assertEqual(round(view.hit_regions[0]["rect"].top()), 913)
         view.close()
 
     def test_original_pixel_zoom_avoids_fractional_dpi_bitmap_enlargement(self):
@@ -677,6 +677,82 @@ class QtFrontendTests(unittest.TestCase):
 
         self.assertEqual(calls, ["face"])
         self.assertEqual(view.render_failures, ())
+        view.close()
+
+    def test_legacy_separators_and_block_bars_match_original_pixel_geometry(self):
+        runtime = SimpleNamespace(
+            default_bgcolor=0,
+            current_color=0xC0C0C0,
+            output=["content"],
+            render_sprite_image=lambda _name: Image.new("RGBA", (1, 1)),
+        )
+        view = GameSceneView()
+        view.configure_rendering(
+            font_pixel_size=18,
+            line_height=18,
+            reference_width=1600,
+            reference_height=100,
+        )
+        view.set_layout(
+            {
+                "drawables": [
+                    {"type": "text", "x": 0, "y": 0, "width": 1602, "height": 18, "text": "=" * 178, "color": 0xC0C0C0, "bgcolor": 0},
+                    {"type": "text", "x": 45, "y": 20, "width": 414, "height": 18, "text": "▅" * 46, "color": 0xC07070, "bgcolor": 0},
+                    {"type": "text", "x": 72, "y": 40, "width": 72, "height": 18, "text": "▄" * 8, "color": 0x202050, "bgcolor": 0},
+                    {"type": "text", "x": 81, "y": 60, "width": 18, "height": 18, "text": "▋" * 2, "color": 0x502020, "bgcolor": 0},
+                ],
+                "canvas": {"width": 1602, "height": 100},
+            },
+            runtime,
+            follow_output=False,
+        )
+        tile = view._raster_tile(0, 0)
+        self.assertIsNotNone(tile)
+
+        self.assertEqual(tile.pixelColor(3, 6).red(), 115)
+        self.assertEqual(tile.pixelColor(10, 6).red(), 0)
+        self.assertEqual(tile.pixelColor(12, 6).red(), 115)
+        self.assertEqual(tile.pixelColor(49, 27).getRgb()[:3], (192, 112, 112))
+        self.assertEqual(tile.pixelColor(461, 36).getRgb()[:3], (192, 112, 112))
+        self.assertEqual(tile.pixelColor(48, 27).getRgb()[:3], (0, 0, 0))
+        self.assertEqual(tile.pixelColor(76, 53).getRgb()[:3], (32, 32, 80))
+        self.assertEqual(tile.pixelColor(146, 57).getRgb()[:3], (32, 32, 80))
+        self.assertEqual(tile.pixelColor(85, 61).getRgb()[:3], (80, 32, 32))
+        self.assertEqual(tile.pixelColor(90, 61).getRgb()[:3], (0, 0, 0))
+        view.close()
+
+    def test_print_image_uses_winapi_bearing_and_bilinear_scaling(self):
+        source = Image.new("RGBA", (2, 1), (0, 0, 0, 255))
+        source.putpixel((0, 0), (255, 0, 0, 255))
+        source.putpixel((1, 0), (0, 0, 255, 255))
+        runtime = SimpleNamespace(
+            default_bgcolor=0,
+            current_color=0xC0C0C0,
+            output=["content"],
+            render_sprite_image=lambda _name: source,
+        )
+        view = GameSceneView()
+        view.set_layout(
+            {
+                "drawables": [
+                    {"type": "print_image", "x": 10, "y": 10, "width": 4, "height": 2, "src": "face"},
+                    {"type": "image", "x": 30, "y": 10, "width": 4, "height": 2, "src": "face"},
+                ],
+                "canvas": {"width": 80, "height": 40},
+            },
+            runtime,
+            follow_output=False,
+        )
+        tile = view._raster_tile(0, 0)
+        self.assertIsNotNone(tile)
+
+        self.assertEqual(tile.pixelColor(10, 10).getRgb()[:3], (0, 0, 0))
+        self.assertGreater(tile.pixelColor(13, 10).red(), tile.pixelColor(13, 10).blue())
+        self.assertGreater(tile.pixelColor(16, 10).blue(), tile.pixelColor(16, 10).red())
+        mixed = tile.pixelColor(14, 10)
+        self.assertGreater(mixed.red(), 0)
+        self.assertGreater(mixed.blue(), 0)
+        self.assertIn(tile.pixelColor(31, 10).getRgb()[:3], {(255, 0, 0), (0, 0, 255)})
         view.close()
 
     def test_missing_sprite_is_reported_and_painted_as_visible_fallback(self):

@@ -506,13 +506,30 @@ class _LegacySceneView(QGraphicsView):
                     region.setPen(QPen(color, 1.0))
                 self._scene.addItem(region)
                 if kind != "print_rect" and label:
-                    text_item = QGraphicsSimpleTextItem(label, region)
-                    text_item.setBrush(QBrush(color))
-                    text_item.setFont(_font_for_drawable(item, pixel_size=max(12, height - 5)))
-                    text_item.setPos(0.0, -1.0)
-                    text_item.setData(CLICK_VALUE_ROLE, button_value)
-                    text_item.setData(HOVER_TITLE_ROLE, title)
-                    text_item.setToolTip(title)
+                    runs = [run for run in item.get("runs", []) if isinstance(run, dict) and str(run.get("text", ""))]
+                    if runs:
+                        cursor = 0
+                        for run in runs:
+                            run_text = str(run.get("text", ""))
+                            run_style = dict(item)
+                            run_style.update(run)
+                            run_font = _font_for_drawable(run_style, pixel_size=max(12, height - 5))
+                            text_item = QGraphicsSimpleTextItem(run_text, region)
+                            text_item.setBrush(QBrush(_qcolor(run.get("color"), color)))
+                            text_item.setFont(run_font)
+                            text_item.setPos(float(cursor), -1.0)
+                            text_item.setData(CLICK_VALUE_ROLE, button_value)
+                            text_item.setData(HOVER_TITLE_ROLE, title)
+                            text_item.setToolTip(title)
+                            cursor += QFontMetrics(run_font).horizontalAdvance(run_text)
+                    else:
+                        text_item = QGraphicsSimpleTextItem(label, region)
+                        text_item.setBrush(QBrush(color))
+                        text_item.setFont(_font_for_drawable(item, pixel_size=max(12, height - 5)))
+                        text_item.setPos(0.0, -1.0)
+                        text_item.setData(CLICK_VALUE_ROLE, button_value)
+                        text_item.setData(HOVER_TITLE_ROLE, title)
+                        text_item.setToolTip(title)
                 continue
 
             if kind in {"text", "html_text"}:
@@ -733,7 +750,7 @@ class GameSceneView(QAbstractScrollArea):
         self._last_painted_count = 0
         self._hit_regions: list[dict[str, Any]] = []
         self._runtime: Any | None = None
-        self._sprite_cache: OrderedDict[tuple[str, int, int, int], QPixmap | None] = OrderedDict()
+        self._sprite_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap | None] = OrderedDict()
         self._sprite_cache_limit = 256
         self._render_failures: set[str] = set()
         self._layout_issues: list[str] = []
@@ -934,11 +951,18 @@ class GameSceneView(QAbstractScrollArea):
         content_extent = max(1, _int(canvas.get("height"), 1), raw_content_bottom)
         output = getattr(runtime, "output", [])
         tail = "".join(str(value) for value in output[-4:]) if output else ""
-        if not output or tail.endswith("\n"):
+        if not output or tail.endswith("\n") or bool(getattr(runtime, "waiting_for_input", False)):
             # PRINTL leaves the cursor on a fresh row.  Emuera includes that
             # row when it pins a short page to the bottom of the 950 px view.
+            # An input boundary likewise reserves a cursor row even when the
+            # final menu command was emitted by PRINTC without a newline.
             content_extent += self.line_height
-        self._content_origin_y = max(0, self._reference_height - content_extent)
+        # WinAPI Emuera leaves its pinned cursor baseline on the final client
+        # pixel.  Reserving that pixel makes every short page (shop, training,
+        # dungeon) begin one pixel above a plain height-minus-content
+        # calculation; without it all portraits and row baselines were 1 px
+        # lower than the original 1600x950 captures.
+        self._content_origin_y = max(0, self._reference_height - content_extent - 1)
         if self._content_origin_y:
             for item in drawables:
                 item["y"] = _int(item.get("y")) + self._content_origin_y
@@ -1407,9 +1431,14 @@ class GameSceneView(QAbstractScrollArea):
                     self._render_failures.add(source or "<empty>")
                     pixmap = None
                 else:
-                    pixmap = self._sprite_pixmap(source, width, height)
+                    is_print_image = kind == "print_image"
+                    pixmap = self._sprite_pixmap(source, width, height, smooth=is_print_image)
                 if pixmap is not None:
-                    painter.drawPixmap(x, y, pixmap)
+                    # WinAPI PRINT_IMG leaves a three-pixel inline bearing and
+                    # scales classic sprite slices bilinearly.  HTML <img>
+                    # nodes retain their explicit coordinate and pixel-art
+                    # sampling path.
+                    painter.drawPixmap(x + (3 if is_print_image else 0), y, pixmap)
                 else:
                     # Match Emuera's unobtrusive PRINT_RECT-style fallback.
                     # Never paint a long ``[IMG:name]`` debug label into the
@@ -1436,13 +1465,18 @@ class GameSceneView(QAbstractScrollArea):
                     # PRINTBUTTON/HTML button visuals are plain text in the
                     # original frontend.  Click geometry is maintained by the
                     # separate hit layer and is intentionally not painted.
-                    self._draw_text(painter, label, x, y, height, color, item)
+                    self._draw_control_label(painter, label, x, y, height, color, item)
                 continue
 
             if kind in {"text", "html_text"}:
                 text = str(item.get("text", ""))
                 if text:
-                    self._draw_text(painter, text, x, y, height, color, item)
+                    if len(text) >= 40 and len(set(text)) == 1 and text[0] in {"=", "─"}:
+                        self._draw_legacy_separator(painter, text[0], x, y, width, color)
+                    elif len(set(text)) == 1 and text[0] in {"▅", "▄", "▋"}:
+                        self._draw_legacy_block_bar(painter, text[0], x, y, width, color)
+                    else:
+                        self._draw_text(painter, text, x, y, height, color, item)
         if track_stats:
             self._last_painted_count = painted
 
@@ -1466,6 +1500,105 @@ class GameSceneView(QAbstractScrollArea):
             return
         painter.fillRect(bounds, _qcolor(item.get("bgcolor"), _qcolor(self._runtime.default_bgcolor, BACKGROUND)))
         self._draw_text(painter, label, x, y, height, EMUERA_SELECTED_TEXT, item)
+
+    def _draw_control_label(
+        self,
+        painter: QPainter,
+        label: str,
+        x: int,
+        y: int,
+        height: int,
+        color: QColor,
+        item: dict[str, Any],
+    ) -> None:
+        runs = [run for run in item.get("runs", []) if isinstance(run, dict) and str(run.get("text", ""))]
+        if not runs:
+            self._draw_text(painter, label, x, y, height, color, item)
+            return
+        cursor = int(x)
+        for run in runs:
+            text = str(run.get("text", ""))
+            style = dict(item)
+            style.update(run)
+            run_color = _qcolor(run.get("color"), color)
+            self._draw_text(painter, text, cursor, y, height, run_color, style)
+            font = _font_for_drawable(style, pixel_size=self.font_pixel_size)
+            cursor += QFontMetrics(font).horizontalAdvance(text)
+
+    def _draw_legacy_separator(
+        self,
+        painter: QPainter,
+        glyph: str,
+        x: int,
+        y: int,
+        width: int,
+        color: QColor,
+    ) -> None:
+        """Rasterize long Emuera separators like the WinAPI font strike.
+
+        At 18 px MS Gothic the original ``=`` and ``─`` rows consist of
+        seven-pixel strokes separated by two blank pixels.  DirectWrite joins
+        those glyphs into a bright solid rule, which makes every major section
+        boundary visibly wrong.  Recreate the observed bitmap-strike geometry
+        while retaining the active text color.
+        """
+
+        rows = ((6, 0.60), (7, 0.40), (10, 0.595), (11, 0.405)) if glyph == "=" else ((8, 0.585), (9, 0.415))
+        logical_width = min(
+            max(0, int(width)),
+            max(0, self._reference_width - int(x)) if self._reference_width > 0 else max(0, int(width)),
+        )
+        # The WinAPI strike's final antialiased edge ends six pixels before the
+        # fixed client boundary in the canonical 1600 px layout.
+        last_x = int(x) + max(0, logical_width - 6)
+        if last_x < x:
+            return
+        segment_count = max(1, (last_x - (int(x) + 3)) // 9 + 1)
+        for y_offset, opacity in rows:
+            core = QColor(color)
+            core.setAlphaF(opacity)
+            for index in range(segment_count):
+                segment_x = int(x) + 3 + index * 9
+                phase = index / max(1, segment_count - 1)
+                # The original strike accumulates roughly 0.55 px of
+                # subpixel phase across the complete 1600 px row: opacity
+                # migrates linearly from the left edge to the right edge.
+                left = QColor(color)
+                left.setAlphaF(opacity * (1.0 - 0.55 * phase))
+                right = QColor(color)
+                right.setAlphaF(opacity * 0.55 * phase)
+                painter.fillRect(QRect(segment_x, int(y) + y_offset, 1, 1), left)
+                core_width = min(6, last_x - segment_x)
+                if core_width > 0:
+                    painter.fillRect(QRect(segment_x + 1, int(y) + y_offset, core_width, 1), core)
+                edge_x = segment_x + 7
+                if edge_x <= last_x and right.alpha() > 0:
+                    painter.fillRect(QRect(edge_x, int(y) + y_offset, 1, 1), right)
+
+    def _draw_legacy_block_bar(
+        self,
+        painter: QPainter,
+        glyph: str,
+        x: int,
+        y: int,
+        width: int,
+        color: QColor,
+    ) -> None:
+        """Draw the bitmap block glyphs used by eraMegaten's status bars."""
+
+        width = max(0, int(width))
+        if width <= 0:
+            return
+        if glyph == "▅":
+            # 46 cells become one 413x10 uninterrupted HP/MAG bar.
+            painter.fillRect(QRect(int(x) + 4, int(y) + 7, max(1, width - 1), 10), color)
+            return
+        if glyph == "▄":
+            painter.fillRect(QRect(int(x) + 4, int(y) + 13, max(1, width - 1), 5), color)
+            return
+        # U+258B is rendered as a five-pixel vertical strip in each 9 px cell.
+        for cell_x in range(int(x), int(x) + width, 9):
+            painter.fillRect(QRect(cell_x + 4, int(y) + 1, 5, 16), color)
 
     def _draw_text(
         self,
@@ -1505,10 +1638,10 @@ class GameSceneView(QAbstractScrollArea):
         layer_painter.end()
         painter.drawImage(QPointF(float(x - padding), float(y)), layer)
 
-    def _sprite_pixmap(self, source: str, width: int, height: int) -> QPixmap | None:
+    def _sprite_pixmap(self, source: str, width: int, height: int, *, smooth: bool = False) -> QPixmap | None:
         raster_ratio = self._raster_device_pixel_ratio()
         ratio_key = max(1, round(raster_ratio * 1024.0))
-        key = (source, int(width), int(height), ratio_key)
+        key = (source, int(width), int(height), ratio_key, int(bool(smooth)))
         if key in self._sprite_cache:
             self._sprite_cache.move_to_end(key)
             cached = self._sprite_cache[key]
@@ -1524,7 +1657,7 @@ class GameSceneView(QAbstractScrollArea):
                 if image.size != (physical_width, physical_height):
                     image = image.resize(
                         (physical_width, physical_height),
-                        resample=PILImage.Resampling.NEAREST,
+                        resample=PILImage.Resampling.BILINEAR if smooth else PILImage.Resampling.NEAREST,
                     )
                 raw = image.tobytes("raw", "RGBA")
                 qimage = QImage(
